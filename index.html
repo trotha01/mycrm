@@ -3,6 +3,8 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cross-Origin-Opener-Policy" content="same-origin">
+    <meta http-equiv="Cross-Origin-Embedder-Policy" content="require-corp">
     <title>Simple CRM</title>
     <style>
         * {
@@ -427,9 +429,30 @@
             text-align: center;
         }
 
+        .preview-grid {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .preview-card {
+            background: white;
+            border-radius: 12px;
+            padding: 15px;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.08);
+            max-width: 260px;
+        }
+
+        .preview-card h4 {
+            font-size: 0.95rem;
+            color: #495057;
+            margin-bottom: 10px;
+        }
+
         .preview-image {
             max-width: 100%;
-            max-height: 300px;
+            max-height: 220px;
             border-radius: 10px;
             box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
         }
@@ -449,6 +472,50 @@
             height: 30px;
             animation: spin 1s linear infinite;
             margin: 0 auto 15px;
+        }
+
+        .stage-indicator {
+            display: flex;
+            justify-content: space-between;
+            gap: 10px;
+            margin: 15px 0;
+        }
+
+        .stage {
+            flex: 1;
+            padding: 8px 12px;
+            border-radius: 20px;
+            font-size: 0.8rem;
+            background: #e9ecef;
+            color: #6c757d;
+            font-weight: 600;
+            position: relative;
+            transition: all 0.3s ease;
+        }
+
+        .stage::after {
+            content: '';
+            position: absolute;
+            height: 4px;
+            border-radius: 2px;
+            left: 12px;
+            right: 12px;
+            bottom: -6px;
+            background: transparent;
+        }
+
+        .stage.active {
+            background: rgba(79, 172, 254, 0.15);
+            color: #1c7ed6;
+        }
+
+        .stage.completed {
+            background: rgba(66, 185, 131, 0.2);
+            color: #2f9e44;
+        }
+
+        .stage.completed::after {
+            background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%);
         }
 
         @keyframes spin {
@@ -747,20 +814,25 @@
             <div class="upload-area" id="uploadArea" onclick="document.getElementById('fileInput').click()">
                 <div class="upload-icon">📷</div>
                 <div class="upload-text">
-                    <strong>Click to upload</strong> or drag and drop your business card image here
+                    <strong>Click to upload</strong> or drag and drop the front and back of the business card
                 </div>
                 <div style="font-size: 0.85rem; color: #adb5bd;">
-                    Supports JPG, PNG, and other image formats • Demo OCR with realistic processing
+                    Supports JPG, PNG, and other image formats • You can add two images (front and back)
                 </div>
             </div>
 
-            <input type="file" id="fileInput" class="file-input" accept="image/*" onchange="handleFileUpload(event)">
+            <input type="file" id="fileInput" class="file-input" accept="image/*" multiple capture="environment" onchange="handleFileUpload(event)">
 
             <div class="preview-container" id="previewContainer"></div>
 
             <div class="processing-indicator" id="processingIndicator">
                 <div class="spinner"></div>
                 <div id="processingText">Initializing OCR engine...</div>
+                <div class="stage-indicator">
+                    <div class="stage" data-stage="preprocess">Preprocess</div>
+                    <div class="stage" data-stage="recognize">Recognize</div>
+                    <div class="stage" data-stage="parse">Parse</div>
+                </div>
                 <div id="progressBar" style="width: 100%; background: #e9ecef; border-radius: 10px; margin-top: 10px; height: 6px;">
                     <div id="progressFill" style="width: 0%; background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); height: 100%; border-radius: 10px; transition: width 0.3s ease;"></div>
                 </div>
@@ -777,7 +849,7 @@
 
             <div class="modal-actions">
                 <button class="btn-cancel" onclick="closeUploadModal()">Cancel</button>
-                <button class="btn-save" id="createFromUpload" onclick="createContactFromUpload()" style="display: none;">Create Contact</button>
+                <button class="btn-save" id="reviewFromUpload" onclick="reviewExtractedContact()" style="display: none;">Review &amp; Add Contact</button>
             </div>
         </div>
     </div>
@@ -1175,182 +1247,529 @@
         }
 
         // Upload functionality
-        function simulateOCRProcessing(imageDataUrl) {
-            return new Promise((resolve) => {
-                const steps = [
-                    { progress: 10, message: 'Initializing image analysis...', delay: 300 },
-                    { progress: 25, message: 'Detecting text regions...', delay: 400 },
-                    { progress: 45, message: 'Recognizing characters...', delay: 800 },
-                    { progress: 70, message: 'Processing text layout...', delay: 600 },
-                    { progress: 85, message: 'Extracting contact information...', delay: 400 },
-                    { progress: 100, message: 'Analysis complete!', delay: 200 }
-                ];
-                
-                let currentStep = 0;
-                
-                function processNextStep() {
-                    if (currentStep < steps.length) {
-                        const step = steps[currentStep];
-                        updateProgress(step.progress);
-                        document.getElementById('processingText').textContent = step.message;
-                        
-                        setTimeout(() => {
-                            currentStep++;
-                            processNextStep();
-                        }, step.delay);
+        const ocrConfig = {
+            engine: 'ppocr',
+            fallbackEngine: 'tesseract',
+            confidenceThreshold: 0.58,
+            currentEngine: 'ppocr'
+        };
+
+        const scriptRegistry = {};
+        const ocrModelBuffers = {};
+        const ppocrModelManifest = {
+            detector: 'https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@release/2.6/inference/en/en_ppocr_mobile_v2.0_det_infer.onnx',
+            recognizer: 'https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@release/2.6/inference/en/en_ppocr_mobile_v2.0_rec_infer.onnx',
+            dictionary: 'https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@release/2.6/ppocr/utils/ppocr_keys_v1.txt'
+        };
+        const fieldParserScripts = {
+            libphonenumber: 'https://cdn.jsdelivr.net/npm/libphonenumber-js@1.10.25/bundle/libphonenumber-js.min.js',
+            humanparser: 'https://cdn.jsdelivr.net/npm/humanparser@2.2.7/humanparser.min.js',
+            parseAddress: 'https://cdn.jsdelivr.net/npm/parse-address@1.0.4/parse-address.min.js'
+        };
+
+        let uploadedCardImages = [];
+        let ppocrInitialized = false;
+
+        function loadScriptOnce(key, url, attributes = {}) {
+            if (scriptRegistry[key]) {
+                return scriptRegistry[key];
+            }
+
+            if (!attributes.crossorigin) {
+                attributes.crossorigin = 'anonymous';
+            }
+
+            scriptRegistry[key] = new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = url;
+                script.async = true;
+                Object.entries(attributes).forEach(([attr, value]) => {
+                    if (attr.toLowerCase() === 'crossorigin') {
+                        script.crossOrigin = value;
                     } else {
-                        const ocrText = generateRealisticOCRText();
-                        resolve(ocrText);
+                        script.setAttribute(attr, value);
                     }
-                }
-                
-                processNextStep();
+                });
+                script.onload = () => resolve();
+                script.onerror = (event) => {
+                    const reason = event?.message || event?.error?.message || 'unknown error';
+                    reject(new Error(`Failed to load script ${url}: ${reason}`));
+                };
+                document.head.appendChild(script);
+            }).catch(error => {
+                delete scriptRegistry[key];
+                throw error;
             });
-        }
 
-        function generateRealisticOCRText() {
-            const businessCards = [
-                {
-                    text: `ALEXANDRA THOMPSON
-Senior Marketing Manager
-TechCorp Solutions
-
-alex.thompson@techcorp.com
-+1 (555) 987-6543
-www.techcorp.com
-
-123 Innovation Drive, Suite 200
-Tech Valley, CA 94000`,
-                    style: 'corporate'
-                },
-                {
-                    text: `Michael Rodriguez
-Creative Director
-
-INNOVATE DESIGN STUDIO
-
-Email: m.rodriguez@innovatedesign.com
-Phone: (555) 234-9876
-Web: innovatedesign.com
-
-456 Creative Boulevard
-Design City, NY 10001`,
-                    style: 'creative'
-                }
-            ];
-            
-            const selectedCard = businessCards[Math.floor(Math.random() * businessCards.length)];
-            return selectedCard.text;
+            return scriptRegistry[key];
         }
 
         function updateProgress(percentage) {
-            document.getElementById('progressFill').style.width = percentage + '%';
-            document.getElementById('progressPercent').textContent = percentage + '%';
+            document.getElementById('progressFill').style.width = `${percentage}%`;
+            document.getElementById('progressPercent').textContent = `${percentage}%`;
         }
 
-        function extractContactInfo(text) {
-            const contact = {
+        function updateProcessingText(text) {
+            document.getElementById('processingText').textContent = text;
+        }
+
+        function resetStageIndicator() {
+            document.querySelectorAll('.stage-indicator .stage').forEach(stage => {
+                stage.classList.remove('active', 'completed');
+            });
+        }
+
+        function setStageStatus(stageName, status) {
+            const stageElement = document.querySelector(`.stage-indicator .stage[data-stage="${stageName}"]`);
+            if (!stageElement) return;
+
+            stageElement.classList.remove('active', 'completed');
+            if (status === 'active') {
+                stageElement.classList.add('active');
+            } else if (status === 'completed') {
+                stageElement.classList.add('completed');
+            }
+        }
+
+        function readFileAsDataUrl(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(reader.result);
+                reader.onerror = reject;
+                reader.readAsDataURL(file);
+            });
+        }
+
+        let fieldParserLoadAttempted = false;
+        let fieldParsersAvailable = false;
+
+        async function ensureFieldParsers() {
+            if (fieldParsersAvailable || fieldParserLoadAttempted) {
+                return;
+            }
+
+            fieldParserLoadAttempted = true;
+
+            try {
+                await Promise.all([
+                    loadScriptOnce('libphonenumber', fieldParserScripts.libphonenumber),
+                    loadScriptOnce('humanparser', fieldParserScripts.humanparser),
+                    loadScriptOnce('parseAddress', fieldParserScripts.parseAddress)
+                ]);
+                fieldParsersAvailable = true;
+            } catch (error) {
+                console.warn('Field parser libraries unavailable, continuing with heuristic parsing.', error);
+                fieldParserLoadAttempted = false;
+            }
+        }
+
+        async function ensureTesseract() {
+            await loadScriptOnce('tesseract', 'https://cdn.jsdelivr.net/npm/tesseract.js@5.0.2/dist/tesseract.min.js');
+        }
+
+        async function fetchModelBuffer(key, url) {
+            if (ocrModelBuffers[key]) {
+                return ocrModelBuffers[key];
+            }
+
+            const response = await fetch(url);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch ${key} model: ${response.statusText}`);
+            }
+            const buffer = await response.arrayBuffer();
+            ocrModelBuffers[key] = buffer;
+            return buffer;
+        }
+
+        async function ensurePPOCREngine() {
+            if (ppocrInitialized) {
+                return;
+            }
+
+            await Promise.all([
+                loadScriptOnce('opencv', 'https://cdn.jsdelivr.net/npm/opencv.js@4.8.0/opencv.js'),
+                loadScriptOnce('ort', 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js')
+            ]);
+
+            await Promise.all([
+                fetchModelBuffer('detector', ppocrModelManifest.detector),
+                fetchModelBuffer('recognizer', ppocrModelManifest.recognizer),
+                fetchModelBuffer('dictionary', ppocrModelManifest.dictionary)
+            ]);
+
+            ppocrInitialized = true;
+        }
+
+        async function runPPOCRInference(imageDataUrl, progressCallback) {
+            if (!window.cv || !window.ort) {
+                throw new Error('PP-OCR dependencies not available');
+            }
+
+            // Placeholder for PP-OCR inference via ONNX Runtime Web.
+            throw new Error('PP-OCR inference pipeline is not available in this demo environment');
+        }
+
+        async function runOCREngine(imageDataUrl, label, progressCallback) {
+            if (ocrConfig.currentEngine === 'ppocr') {
+                try {
+                    await ensurePPOCREngine();
+                    const ppocrResult = await runPPOCRInference(imageDataUrl, progressCallback);
+                    if (!ppocrResult.text || (ppocrResult.confidence || 0) < ocrConfig.confidenceThreshold * 100) {
+                        throw new Error('PP-OCR confidence below threshold');
+                    }
+                    return { ...ppocrResult, engineUsed: 'ppocr' };
+                } catch (error) {
+                    console.warn('PP-OCR failed, switching to Tesseract.js fallback.', error);
+                    ocrConfig.currentEngine = ocrConfig.fallbackEngine;
+                    return runOCREngine(imageDataUrl, label, progressCallback);
+                }
+            }
+
+            await ensureTesseract();
+
+            const result = await Tesseract.recognize(imageDataUrl, 'eng', {
+                logger: message => {
+                    if (progressCallback && message.status === 'recognizing text') {
+                        progressCallback(Math.round((message.progress || 0) * 100));
+                    }
+                }
+            });
+
+            return {
+                text: result.data?.text || '',
+                confidence: result.data?.confidence || 0,
+                engineUsed: 'tesseract'
+            };
+        }
+
+        async function preprocessImage(dataUrl) {
+            return new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = image.width;
+                    canvas.height = image.height;
+                    const context = canvas.getContext('2d');
+                    context.drawImage(image, 0, 0);
+
+                    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+                    const { data } = imageData;
+                    for (let i = 0; i < data.length; i += 4) {
+                        const grayscale = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+                        data[i] = data[i + 1] = data[i + 2] = grayscale;
+                    }
+                    context.putImageData(imageData, 0, 0);
+                    resolve(canvas.toDataURL('image/png'));
+                };
+                image.onerror = reject;
+                image.src = dataUrl;
+            });
+        }
+
+        async function extractContactInfo(fullText, recognitionResults, averageConfidence) {
+            await ensureFieldParsers();
+
+            const info = {
                 name: '',
                 email: '',
                 phone: '',
                 company: '',
-                title: ''
+                title: '',
+                rawText: fullText,
+                engineUsed: recognitionResults[0]?.engineUsed || ocrConfig.currentEngine,
+                confidence: typeof averageConfidence === 'number' ? Number(averageConfidence.toFixed(2)) : null,
+                segments: recognitionResults.map(result => ({
+                    side: result.label,
+                    text: (result.text || '').trim(),
+                    confidence: typeof result.confidence === 'number' ? Number(result.confidence.toFixed(2)) : null,
+                    engine: result.engineUsed
+                })),
+                tags: []
             };
-            
-            const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-            
-            const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
-            const emailMatches = text.match(emailRegex);
-            if (emailMatches && emailMatches.length > 0) {
-                contact.email = emailMatches[0].toLowerCase();
+
+            const lines = fullText
+                .split(/\n+/)
+                .map(line => line.trim())
+                .filter(line => line.length > 0);
+
+            const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/gi;
+            const emailMatch = fullText.match(emailRegex);
+            if (emailMatch && emailMatch.length > 0) {
+                info.email = emailMatch[0].toLowerCase();
             }
-            
-            const phoneRegex = /(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})|(\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9})/g;
-            const phoneMatches = text.match(phoneRegex);
-            if (phoneMatches && phoneMatches.length > 0) {
-                let phone = phoneMatches[0].replace(/[^\d+]/g, '');
-                if (phone.length === 10) {
-                    phone = `+1${phone}`;
-                }
-                if (phone.length === 11 && phone.startsWith('1')) {
-                    phone = phone.substring(1);
-                }
-                if (phone.length === 10) {
-                    contact.phone = `+1 (${phone.substring(0,3)}) ${phone.substring(3,6)}-${phone.substring(6)}`;
-                } else {
-                    contact.phone = phoneMatches[0];
-                }
-            }
-            
-            const titleKeywords = ['ceo', 'cto', 'cfo', 'president', 'director', 'manager', 'lead', 'senior', 'junior', 'associate', 'consultant', 'analyst', 'specialist', 'coordinator', 'supervisor', 'executive', 'officer'];
-            const companyKeywords = ['inc', 'llc', 'corp', 'company', 'ltd', 'limited', 'corporation', 'group', 'solutions', 'services', 'consulting', 'partners', 'associates'];
-            
-            for (let i = 0; i < lines.length; i++) {
-                const line = lines[i];
-                const lowerLine = line.toLowerCase();
-                
-                if (emailRegex.test(line) || phoneRegex.test(line) || line.length < 2 || /^\d+$/.test(line)) {
-                    continue;
-                }
-                
-                const namePattern = /^[A-Za-z]+(?:\s[A-Za-z]+)+$/;
-                if (namePattern.test(line) && !contact.name && line.split(' ').length >= 2 && line.split(' ').length <= 4) {
-                    const hasCommonTitle = titleKeywords.some(keyword => lowerLine.includes(keyword));
-                    const hasCompanyIndicator = companyKeywords.some(keyword => lowerLine.includes(keyword));
-                    
-                    if (!hasCommonTitle && !hasCompanyIndicator) {
-                        contact.name = line;
-                        continue;
-                    }
-                }
-                
-                if (titleKeywords.some(keyword => lowerLine.includes(keyword)) && !contact.title) {
-                    contact.title = line;
-                    continue;
-                }
-                
-                if (companyKeywords.some(keyword => lowerLine.includes(keyword)) && !contact.company) {
-                    contact.company = line;
-                    continue;
-                }
-                
-                if (!contact.name && line.split(' ').length >= 2 && line.split(' ').length <= 3 && 
-                    !lowerLine.includes('www') && !lowerLine.includes('.com') && 
-                    !/\d/.test(line) && line.length > 5) {
-                    contact.name = line;
-                }
-            }
-            
-            if (!contact.name) {
+
+            const phoneParser = window.libphonenumber?.parsePhoneNumberFromString;
+            if (phoneParser) {
                 for (const line of lines) {
-                    if (line.length > 3 && line.length < 40 && 
-                        !emailRegex.test(line) && !phoneRegex.test(line) &&
-                        !line.toLowerCase().includes('www') && 
-                        !/^\d+/.test(line) &&
-                        line.split(' ').length >= 2) {
-                        contact.name = line;
+                    const parsed = phoneParser(line, 'US');
+                    if (parsed && parsed.isValid()) {
+                        info.phone = parsed.formatInternational();
                         break;
                     }
                 }
             }
-            
-            if (!contact.name && lines.length > 0) {
-                for (let i = 0; i < Math.min(3, lines.length); i++) {
-                    const line = lines[i];
-                    if (line.length > 3 && line.split(' ').length >= 2) {
-                        contact.name = line;
-                        break;
+
+            if (!info.phone) {
+                const fallbackLine = lines.find(line => /\d{3}[)\s.-]*\d{3}[\s.-]*\d{4}/.test(line));
+                if (fallbackLine) {
+                    const match = fallbackLine.match(/\+?\d[\d\s().-]{7,}/);
+                    if (match) {
+                        info.phone = match[0];
                     }
                 }
             }
-            
-            Object.keys(contact).forEach(key => {
-                if (contact[key]) {
-                    contact[key] = contact[key].trim();
+
+            const titleKeywords = ['ceo', 'cto', 'cfo', 'president', 'director', 'manager', 'lead', 'senior', 'junior', 'associate', 'consultant', 'analyst', 'specialist', 'coordinator', 'supervisor', 'executive', 'officer', 'founder'];
+            const companyKeywords = ['inc', 'llc', 'corp', 'company', 'ltd', 'limited', 'corporation', 'group', 'solutions', 'services', 'consulting', 'partners', 'associates', 'studio', 'labs'];
+
+            const nameParser = window.humanparser?.parseName;
+            for (const line of lines) {
+                const lower = line.toLowerCase();
+                if (info.email && line.includes(info.email)) continue;
+                if (info.phone && line.includes(info.phone.replace(/[^\d]/g, ''))) continue;
+
+                if (!info.title && titleKeywords.some(keyword => lower.includes(keyword))) {
+                    info.title = line;
+                    continue;
                 }
+
+                if (!info.company && companyKeywords.some(keyword => lower.includes(keyword))) {
+                    info.company = line;
+                    continue;
+                }
+
+                if (!info.name && nameParser) {
+                    const parsedName = nameParser(line);
+                    if (parsedName && parsedName.firstName && parsedName.lastName) {
+                        const parts = [parsedName.firstName, parsedName.middleName, parsedName.lastName]
+                            .filter(Boolean)
+                            .join(' ')
+                            .trim();
+                        if (parts.length > 0) {
+                            info.name = parts;
+                            continue;
+                        }
+                    }
+                }
+
+                if (!info.name && /^[A-Za-z]+(?:\s[A-Za-z.'-]+){1,3}$/.test(line)) {
+                    info.name = line;
+                }
+            }
+
+            if (!info.company) {
+                const fallbackCompany = lines.find(line => !line.includes(info.name) && !line.includes(info.email) && !/\d/.test(line) && line.length > 3);
+                if (fallbackCompany) {
+                    info.company = fallbackCompany;
+                }
+            }
+
+            if (!info.name && info.email) {
+                const emailPrefix = info.email.split('@')[0].replace(/[._]/g, ' ');
+                info.name = emailPrefix.split(' ').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+            }
+
+            const inferredTags = new Set();
+            if (info.title) {
+                const lowerTitle = info.title.toLowerCase();
+                if (lowerTitle.includes('marketing') || lowerTitle.includes('sales')) {
+                    inferredTags.add('prospect');
+                }
+                if (lowerTitle.includes('founder') || lowerTitle.includes('ceo')) {
+                    inferredTags.add('executive');
+                }
+                if (lowerTitle.includes('director') || lowerTitle.includes('manager')) {
+                    inferredTags.add('decision-maker');
+                }
+            }
+            if (info.company) {
+                inferredTags.add('imported');
+            }
+            info.tags = Array.from(inferredTags);
+
+            return info;
+        }
+
+        function renderPreview(files) {
+            const previewContainer = document.getElementById('previewContainer');
+            previewContainer.innerHTML = '';
+            if (!files || files.length === 0) {
+                return;
+            }
+
+            const grid = document.createElement('div');
+            grid.className = 'preview-grid';
+
+            files.forEach((file, index) => {
+                const card = document.createElement('div');
+                card.className = 'preview-card';
+
+                const title = document.createElement('h4');
+                title.textContent = index === 0 ? 'Front Side' : 'Back Side';
+                card.appendChild(title);
+
+                const img = new Image();
+                img.className = 'preview-image';
+                img.alt = `Business card ${index === 0 ? 'front' : 'back'} preview`;
+
+                const reader = new FileReader();
+                reader.onload = event => {
+                    img.src = event.target.result;
+                };
+                reader.readAsDataURL(file);
+
+                card.appendChild(img);
+                grid.appendChild(card);
             });
-            
-            return contact;
+
+            previewContainer.appendChild(grid);
+        }
+
+        async function processBusinessCard(files) {
+            if (!files || files.length === 0) {
+                return;
+            }
+
+            document.getElementById('uploadArea').className = 'upload-area processing';
+            document.getElementById('extractedInfo').style.display = 'none';
+            document.getElementById('reviewFromUpload').style.display = 'none';
+            document.getElementById('processingIndicator').style.display = 'block';
+            updateProcessingText('Preparing images for OCR...');
+            updateProgress(5);
+            resetStageIndicator();
+            setStageStatus('preprocess', 'active');
+
+            try {
+                const labeledImages = await Promise.all(files.map((file, index) =>
+                    readFileAsDataUrl(file).then(dataUrl => ({
+                        file,
+                        dataUrl,
+                        label: index === 0 ? 'front' : 'back'
+                    }))
+                ));
+                uploadedCardImages = labeledImages;
+
+                const preprocessedImages = [];
+                for (const image of labeledImages) {
+                    updateProcessingText(`Preprocessing ${image.label} image...`);
+                    const processed = await preprocessImage(image.dataUrl);
+                    preprocessedImages.push({ ...image, preprocessed: processed });
+                }
+
+                setStageStatus('preprocess', 'completed');
+                setStageStatus('recognize', 'active');
+                updateProgress(30);
+
+                const recognitionResults = [];
+                let totalConfidence = 0;
+
+                for (let i = 0; i < preprocessedImages.length; i++) {
+                    const image = preprocessedImages[i];
+                    updateProcessingText(`Recognizing text on ${image.label} side...`);
+                    const recognition = await runOCREngine(image.preprocessed, image.label, (percent) => {
+                        const base = 30 + (i / preprocessedImages.length) * 40;
+                        const share = 40 / preprocessedImages.length;
+                        const progressValue = base + (percent / 100) * share;
+                        updateProgress(Math.min(75, Math.round(progressValue)));
+                    });
+                    recognitionResults.push({
+                        ...image,
+                        text: recognition.text,
+                        confidence: recognition.confidence,
+                        engineUsed: recognition.engineUsed
+                    });
+                    if (typeof recognition.confidence === 'number') {
+                        totalConfidence += recognition.confidence;
+                    }
+                }
+
+                const averageConfidence = recognitionResults.length ? totalConfidence / recognitionResults.length : 0;
+                setStageStatus('recognize', 'completed');
+                setStageStatus('parse', 'active');
+                updateProgress(85);
+                updateProcessingText('Parsing contact fields...');
+
+                const combinedText = recognitionResults.map(result => result.text).join('\n');
+                const parsedInfo = await extractContactInfo(combinedText, recognitionResults, averageConfidence);
+
+                setStageStatus('parse', 'completed');
+                updateProgress(100);
+                updateProcessingText('Finished parsing! Review the extracted information.');
+
+                displayExtractedInfo(parsedInfo);
+            } catch (error) {
+                console.error('Failed to process business card', error);
+                updateProcessingText('Unable to process the card. Please try again or enter details manually.');
+                updateProgress(100);
+                document.getElementById('uploadArea').className = 'upload-area';
+            }
+        }
+
+        function displayExtractedInfo(data) {
+            extractedContactData = data;
+
+            document.getElementById('processingIndicator').style.display = 'none';
+            document.getElementById('uploadArea').className = 'upload-area';
+
+            const infoGrid = document.getElementById('infoGrid');
+            const confidenceText = data.confidence ? `${data.confidence.toFixed(1)}%` : 'N/A';
+            infoGrid.innerHTML = `
+                <div class="info-item">
+                    <span class="info-label">Name:</span>
+                    <span class="info-value">${data.name || '—'}</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Email:</span>
+                    <span class="info-value">${data.email || '—'}</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Phone:</span>
+                    <span class="info-value">${data.phone || '—'}</span>
+                </div>
+                ${data.company ? `
+                <div class="info-item">
+                    <span class="info-label">Company:</span>
+                    <span class="info-value">${data.company}</span>
+                </div>
+                ` : ''}
+                ${data.title ? `
+                <div class="info-item">
+                    <span class="info-label">Title:</span>
+                    <span class="info-value">${data.title}</span>
+                </div>
+                ` : ''}
+                <div class="info-item">
+                    <span class="info-label">Engine:</span>
+                    <span class="info-value">${(data.engineUsed || 'tesseract').toUpperCase()} • Confidence ${confidenceText}</span>
+                </div>
+            `;
+
+            if (Array.isArray(data.segments) && data.segments.length > 0) {
+                infoGrid.innerHTML += data.segments.map(segment => `
+                    <div class="info-item">
+                        <span class="info-label">${segment.side === 'front' ? 'Front Text' : 'Back Text'}:</span>
+                        <span class="info-value" style="white-space: pre-wrap; text-align: left;">${segment.text || '—'}</span>
+                    </div>
+                `).join('');
+            }
+
+            document.getElementById('extractedInfo').style.display = 'block';
+            document.getElementById('reviewFromUpload').style.display = 'inline-block';
+        }
+
+        function reviewExtractedContact() {
+            if (!extractedContactData) return;
+
+            const data = { ...extractedContactData };
+            closeUploadModal();
+            openAddModal();
+
+            document.getElementById('contactName').value = data.name || '';
+            document.getElementById('contactEmail').value = data.email || '';
+            document.getElementById('contactPhone').value = data.phone || '';
+
+            currentContactTags = data.tags ? [...data.tags] : [];
+            updateCurrentTagsDisplay();
         }
 
         function openUploadModal() {
@@ -1368,155 +1787,69 @@ Design City, NY 10001`,
             document.getElementById('previewContainer').innerHTML = '';
             document.getElementById('processingIndicator').style.display = 'none';
             document.getElementById('extractedInfo').style.display = 'none';
-            document.getElementById('createFromUpload').style.display = 'none';
+            document.getElementById('reviewFromUpload').style.display = 'none';
             document.getElementById('uploadArea').className = 'upload-area';
             document.getElementById('progressFill').style.width = '0%';
             document.getElementById('progressPercent').textContent = '0%';
             document.getElementById('processingText').textContent = 'Initializing OCR engine...';
+            resetStageIndicator();
+            ocrConfig.currentEngine = ocrConfig.engine;
+            uploadedCardImages = [];
             extractedContactData = null;
         }
 
-        function handleFileUpload(event) {
-            const file = event.target.files[0];
-            if (!file) return;
+        async function handleFileUpload(event) {
+            const files = Array.from(event.target.files || [])
+                .filter(file => file.type.startsWith('image/'))
+                .slice(0, 2);
 
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                document.getElementById('previewContainer').innerHTML = `
-                    <img src="${e.target.result}" class="preview-image" alt="Business card preview">
-                `;
-                
-                processBusinessCard(e.target.result);
-            };
-            reader.readAsDataURL(file);
+            if (files.length === 0) {
+                return;
+            }
+
+            renderPreview(files);
+            await processBusinessCard(files);
         }
 
-        function processBusinessCard(imageDataUrl) {
-            document.getElementById('uploadArea').className = 'upload-area processing';
-            document.getElementById('processingIndicator').style.display = 'block';
-            document.getElementById('processingText').textContent = 'Preparing image analysis...';
-            updateProgress(5);
-            
-            performOCR(imageDataUrl);
+        async function performDropUpload(files) {
+            const fileArray = Array.from(files || []).filter(file => file.type.startsWith('image/')).slice(0, 2);
+            if (fileArray.length === 0) {
+                return;
+            }
+
+            renderPreview(fileArray);
+            await processBusinessCard(fileArray);
         }
 
-        async function performOCR(imageDataUrl) {
-            try {
-                const text = await simulateOCRProcessing(imageDataUrl);
-                const contactInfo = extractContactInfo(text);
-                
-                setTimeout(() => {
-                    displayExtractedInfo(contactInfo);
-                }, 300);
-                
-            } catch (error) {
-                console.error('Processing Error:', error);
-                document.getElementById('processingIndicator').style.display = 'none';
-                document.getElementById('uploadArea').className = 'upload-area';
-                alert('Failed to process the image. Please try again.');
+        function handleDrop(event) {
+            event.preventDefault();
+            event.stopPropagation();
+            const files = event.dataTransfer?.files;
+            if (files && files.length > 0) {
+                performDropUpload(files);
             }
         }
-
-        function displayExtractedInfo(data) {
-            extractedContactData = data;
-            
-            document.getElementById('processingIndicator').style.display = 'none';
-            document.getElementById('uploadArea').className = 'upload-area';
-            
-            const infoGrid = document.getElementById('infoGrid');
-            infoGrid.innerHTML = `
-                <div class="info-item">
-                    <span class="info-label">Name:</span>
-                    <span class="info-value">${data.name}</span>
-                </div>
-                <div class="info-item">
-                    <span class="info-label">Email:</span>
-                    <span class="info-value">${data.email}</span>
-                </div>
-                <div class="info-item">
-                    <span class="info-label">Phone:</span>
-                    <span class="info-value">${data.phone}</span>
-                </div>
-                ${data.company ? `
-                <div class="info-item">
-                    <span class="info-label">Company:</span>
-                    <span class="info-value">${data.company}</span>
-                </div>
-                ` : ''}
-                ${data.title ? `
-                <div class="info-item">
-                    <span class="info-label">Title:</span>
-                    <span class="info-value">${data.title}</span>
-                </div>
-                ` : ''}
-            `;
-            
-            document.getElementById('extractedInfo').style.display = 'block';
-            document.getElementById('createFromUpload').style.display = 'inline-block';
-        }
-
-        function createContactFromUpload() {
-            if (!extractedContactData) return;
-            
-            const newContact = {
-                id: Math.max(...contacts.map(c => c.id)) + 1,
-                name: extractedContactData.name,
-                email: extractedContactData.email,
-                phone: extractedContactData.phone,
-                company: extractedContactData.company || '',
-                title: extractedContactData.title || '',
-                lastContact: new Date().toISOString().split('T')[0],
-                tags: ['new', 'imported']
-            };
-            
-            contacts.unshift(newContact);
-            searchContacts();
-            updateTagFilters();
-            closeUploadModal();
-            
-            alert(`Contact "${newContact.name}" has been successfully added to your CRM!`);
-        }
-
         function setupDragAndDrop() {
             const uploadArea = document.getElementById('uploadArea');
-            
+
             ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
                 uploadArea.addEventListener(eventName, preventDefaults, false);
             });
 
-            function preventDefaults(e) {
-                e.preventDefault();
-                e.stopPropagation();
+            function preventDefaults(event) {
+                event.preventDefault();
+                event.stopPropagation();
             }
 
             ['dragenter', 'dragover'].forEach(eventName => {
-                uploadArea.addEventListener(eventName, highlight, false);
+                uploadArea.addEventListener(eventName, () => uploadArea.classList.add('dragover'), false);
             });
 
             ['dragleave', 'drop'].forEach(eventName => {
-                uploadArea.addEventListener(eventName, unhighlight, false);
+                uploadArea.addEventListener(eventName, () => uploadArea.classList.remove('dragover'), false);
             });
 
-            function highlight(e) {
-                uploadArea.classList.add('dragover');
-            }
-
-            function unhighlight(e) {
-                uploadArea.classList.remove('dragover');
-            }
-
             uploadArea.addEventListener('drop', handleDrop, false);
-
-            function handleDrop(e) {
-                const dt = e.dataTransfer;
-                const files = dt.files;
-                
-                if (files.length > 0) {
-                    const fileInput = document.getElementById('fileInput');
-                    fileInput.files = files;
-                    handleFileUpload({ target: fileInput });
-                }
-            }
         }
 
         window.onclick = function(event) {
