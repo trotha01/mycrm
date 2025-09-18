@@ -840,6 +840,173 @@
         let currentContactTags = [];
         let activeTagFilters = [];
 
+        const fieldParserScripts = [
+            {
+                key: 'libphonenumber',
+                label: 'libphonenumber',
+                src: './vendor/libphonenumber.min.js',
+                test: hasLibPhoneNumber
+            },
+            {
+                key: 'humanparser',
+                label: 'humanparser',
+                src: './vendor/humanparser.js',
+                test: hasHumanParser
+            },
+            {
+                key: 'parseAddress',
+                label: 'parse-address',
+                src: './vendor/parse-address.min.js',
+                test: hasParseAddress
+            }
+        ];
+
+        const parserLoadAttempts = new Map();
+        const parserLogStatus = new Map();
+        let parserAvailability = {};
+
+        function resolveLibPhoneNumber() {
+            const namespaces = [];
+
+            if (window.i18n && window.i18n.phonenumbers) {
+                namespaces.push(window.i18n.phonenumbers);
+            }
+
+            if (window.libphonenumber) {
+                namespaces.push(window.libphonenumber);
+            }
+
+            for (const namespace of namespaces) {
+                if (!namespace || typeof namespace !== 'object') {
+                    continue;
+                }
+
+                const util = namespace.PhoneNumberUtil;
+                if (util && typeof util.getInstance === 'function') {
+                    const formatEnum = namespace.PhoneNumberFormat || null;
+                    return { util, formatEnum };
+                }
+            }
+
+            return null;
+        }
+
+        function hasLibPhoneNumber() {
+            return !!resolveLibPhoneNumber();
+        }
+
+        function hasHumanParser() {
+            return !!(window.humanparser && typeof window.humanparser.parseName === 'function');
+        }
+
+        function hasParseAddress() {
+            const parser = getAddressParserInstance();
+            if (!parser) {
+                return false;
+            }
+            return typeof parser.parseLocation === 'function' ||
+                typeof parser.parseAddress === 'function' ||
+                typeof parser.parseInformalAddress === 'function';
+        }
+
+        function safeParserTest(entry) {
+            try {
+                return !!entry.test();
+            } catch (error) {
+                console.warn(`[Field Parsers] Error while checking ${entry.label || entry.key}:`, error);
+                return false;
+            }
+        }
+
+        function loadParserScript(entry) {
+            if (safeParserTest(entry)) {
+                return Promise.resolve({ entry, ok: true, status: 'ready' });
+            }
+
+            if (parserLoadAttempts.has(entry.key)) {
+                return parserLoadAttempts.get(entry.key);
+            }
+
+            const promise = new Promise(resolve => {
+                const script = document.createElement('script');
+                script.src = entry.src;
+                script.async = true;
+
+                script.onload = function () {
+                    const available = safeParserTest(entry);
+                    if (!available) {
+                        parserLoadAttempts.delete(entry.key);
+                    }
+                    resolve({
+                        entry,
+                        ok: available,
+                        status: available ? 'loaded' : 'missing-global',
+                        error: available ? null : new Error('Global object not exposed after script load')
+                    });
+                };
+
+                script.onerror = function () {
+                    parserLoadAttempts.delete(entry.key);
+                    resolve({
+                        entry,
+                        ok: false,
+                        status: 'load-error',
+                        error: new Error(`Failed to load script ${entry.src}`)
+                    });
+                };
+
+                document.head.appendChild(script);
+            });
+
+            parserLoadAttempts.set(entry.key, promise);
+            return promise;
+        }
+
+        async function ensureFieldParsers() {
+            const availability = {};
+            const settledResults = await Promise.allSettled(
+                fieldParserScripts.map(entry => loadParserScript(entry))
+            );
+
+            settledResults.forEach((settled, index) => {
+                const entry = fieldParserScripts[index];
+
+                if (settled.status === 'fulfilled' && settled.value) {
+                    const result = settled.value;
+                    if (result.ok) {
+                        availability[entry.key] = true;
+                        const alreadyLogged = parserLogStatus.get(entry.key) === 'loaded';
+                        if (!alreadyLogged) {
+                            const messageDetail = result.status === 'loaded'
+                                ? `loaded from ${entry.src}`
+                                : 'ready';
+                            console.info(`[Field Parsers] ${entry.label || entry.key} ${messageDetail}.`);
+                            parserLogStatus.set(entry.key, 'loaded');
+                        }
+                    } else {
+                        const error = result.error instanceof Error
+                            ? result.error
+                            : new Error('Unknown parser load failure');
+                        console.error(
+                            `[Field Parsers] Unable to load ${entry.label || entry.key} from ${entry.src}`,
+                            error
+                        );
+                    }
+                } else {
+                    const reason = settled.status === 'rejected' ? settled.reason : null;
+                    const error = reason instanceof Error ? reason : new Error(String(reason));
+                    console.error(
+                        `[Field Parsers] Unable to load ${entry.label || entry.key} from ${entry.src}`,
+                        error
+                    );
+                }
+            });
+
+            parserAvailability = availability;
+            return Object.assign({}, parserAvailability);
+        }
+
+
         // Tags functionality
         function getAllTags() {
             const allTags = new Set();
@@ -1248,84 +1415,349 @@ Design City, NY 10001`,
             document.getElementById('progressPercent').textContent = percentage + '%';
         }
 
+        function getAddressParserInstance() {
+            if (window.parseAddress && typeof window.parseAddress === 'object') {
+                return window.parseAddress;
+            }
+            if (window.addressParser && typeof window.addressParser === 'object') {
+                return window.addressParser;
+            }
+            if (typeof window.parseAddress === 'function') {
+                return { parseLocation: window.parseAddress };
+            }
+            return null;
+        }
+
+        function formatParsedAddress(parsed) {
+            if (!parsed || typeof parsed !== 'object') {
+                return '';
+            }
+
+            const lines = [];
+            const streetLine = [parsed.number, parsed.prefix, parsed.street, parsed.type, parsed.suffix]
+                .filter(Boolean)
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            if (streetLine) {
+                lines.push(streetLine);
+            }
+
+            const unitLine = [parsed.sec_unit_type, parsed.sec_unit_num]
+                .filter(Boolean)
+                .join(' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+
+            if (unitLine) {
+                lines.push(unitLine);
+            }
+
+            let cityState = '';
+            if (parsed.city && parsed.state) {
+                cityState = `${parsed.city}, ${parsed.state}`;
+            } else if (parsed.city) {
+                cityState = parsed.city;
+            } else if (parsed.state) {
+                cityState = parsed.state;
+            }
+
+            const postalCode = parsed.zip ? (parsed.zip4 ? `${parsed.zip}-${parsed.zip4}` : parsed.zip) : '';
+            const localityLine = [cityState, postalCode]
+                .filter(Boolean)
+                .join(' ')
+                .trim();
+
+            if (localityLine) {
+                lines.push(localityLine);
+            }
+
+            if (parsed.country && parsed.country.toLowerCase() !== 'us' && parsed.country.toLowerCase() !== 'usa') {
+                lines.push(parsed.country);
+            }
+
+            return lines.join('\n');
+        }
+
+        function extractAddressFromLines(lines) {
+            if (!parserAvailability.parseAddress) {
+                return '';
+            }
+
+            const parser = getAddressParserInstance();
+            if (!parser) {
+                return '';
+            }
+
+            const candidateSegments = [];
+            lines.forEach(line => {
+                const trimmed = line.trim();
+                if (!trimmed) {
+                    return;
+                }
+                if (/\d/.test(trimmed) && /[A-Za-z]/.test(trimmed) && trimmed.length <= 80) {
+                    candidateSegments.push(trimmed);
+                }
+            });
+
+            if (candidateSegments.length === 0) {
+                return '';
+            }
+
+            const combined = candidateSegments.join(' ');
+            let parsed = null;
+
+            try {
+                if (typeof parser.parseLocation === 'function') {
+                    parsed = parser.parseLocation(combined);
+                }
+                if (!parsed && typeof parser.parseAddress === 'function') {
+                    parsed = parser.parseAddress(combined);
+                }
+                if (!parsed && typeof parser.parseInformalAddress === 'function') {
+                    parsed = parser.parseInformalAddress(combined);
+                }
+            } catch (error) {
+                console.warn('[Field Parsers] Unable to parse address text:', error);
+                return '';
+            }
+
+            if (!parsed) {
+                return '';
+            }
+
+            return formatParsedAddress(parsed);
+        }
+
+        function formatPhoneNumberWithLib(rawPhone) {
+            if (!parserAvailability.libphonenumber) {
+                return null;
+            }
+
+            try {
+                const resolved = resolveLibPhoneNumber();
+                if (!resolved) {
+                    return null;
+                }
+
+                const utilFactory = resolved.util;
+                if (!utilFactory || typeof utilFactory.getInstance !== 'function') {
+                    return null;
+                }
+
+                const phoneUtil = utilFactory.getInstance();
+
+                if (!phoneUtil || typeof phoneUtil.parseAndKeepRawInput !== 'function') {
+                    return null;
+                }
+
+                const number = phoneUtil.parseAndKeepRawInput(rawPhone, 'US');
+                if (!phoneUtil.isValidNumber(number)) {
+                    return null;
+                }
+
+                const formatEnum = resolved.formatEnum;
+
+                if (formatEnum && typeof formatEnum.INTERNATIONAL !== 'undefined') {
+                    return phoneUtil.format(number, formatEnum.INTERNATIONAL);
+                }
+
+                return phoneUtil.format(number, 1);
+            } catch (error) {
+                console.warn('[Field Parsers] Unable to format phone number with libphonenumber:', error);
+                return null;
+            }
+        }
+
+        function formatParsedHumanName(parsed) {
+            if (!parsed || typeof parsed !== 'object') {
+                return '';
+            }
+
+            const parts = [];
+            if (parsed.salutation) {
+                parts.push(parsed.salutation);
+            }
+            if (parsed.firstName) {
+                parts.push(parsed.firstName);
+            }
+            if (parsed.middleName) {
+                parts.push(parsed.middleName);
+            }
+            if (parsed.lastName) {
+                parts.push(parsed.lastName);
+            }
+            if (parsed.suffix) {
+                parts.push(parsed.suffix);
+            }
+
+            if (parts.length === 0 && parsed.fullName) {
+                return parsed.fullName;
+            }
+
+            return parts.join(' ').replace(/\s+/g, ' ').trim();
+        }
+
+        function tryParseNameWithHumanParser(candidates, fallbackName) {
+            if (!parserAvailability.humanparser || !hasHumanParser()) {
+                return fallbackName || '';
+            }
+
+            const parseName = window.humanparser.parseName;
+            const queue = [];
+            const seen = new Set();
+
+            (candidates || []).forEach(candidate => {
+                const trimmed = (candidate || '').trim();
+                if (!trimmed) {
+                    return;
+                }
+                const key = trimmed.toLowerCase();
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    queue.push(trimmed);
+                }
+            });
+
+            if (fallbackName) {
+                const normalized = fallbackName.trim();
+                if (normalized) {
+                    const key = normalized.toLowerCase();
+                    if (!seen.has(key)) {
+                        queue.unshift(normalized);
+                        seen.add(key);
+                    } else {
+                        queue.unshift(normalized);
+                    }
+                }
+            }
+
+            for (const candidate of queue) {
+                try {
+                    const parsed = parseName(candidate);
+                    if (parsed && (parsed.firstName || parsed.lastName || parsed.fullName)) {
+                        return formatParsedHumanName(parsed);
+                    }
+                } catch (error) {
+                    console.warn('[Field Parsers] Unable to parse name with humanparser:', error);
+                }
+            }
+
+            return fallbackName || '';
+        }
+
+        function candidateNameFromEmail(email) {
+            if (!email) {
+                return '';
+            }
+
+            const localPart = email.split('@')[0];
+            if (!localPart) {
+                return '';
+            }
+
+            const cleaned = localPart.replace(/[._-]+/g, ' ').trim();
+            if (!/[A-Za-z]/.test(cleaned)) {
+                return '';
+            }
+
+            return cleaned;
+        }
+
         function extractContactInfo(text) {
             const contact = {
                 name: '',
                 email: '',
                 phone: '',
                 company: '',
-                title: ''
+                title: '',
+                address: ''
             };
-            
-            const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-            
+
+            const lines = text.split('\n')
+                .map(line => line.trim())
+                .filter(line => line.length > 0);
+
             const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+            const phoneRegex = /(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})|(\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9})/g;
+
             const emailMatches = text.match(emailRegex);
             if (emailMatches && emailMatches.length > 0) {
                 contact.email = emailMatches[0].toLowerCase();
             }
-            
-            const phoneRegex = /(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})|(\+\d{1,3}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,4}[-.\s]?\d{1,9})/g;
+
+            const candidateNameLines = [];
+
             const phoneMatches = text.match(phoneRegex);
+            let rawPhone = '';
             if (phoneMatches && phoneMatches.length > 0) {
-                let phone = phoneMatches[0].replace(/[^\d+]/g, '');
-                if (phone.length === 10) {
-                    phone = `+1${phone}`;
+                rawPhone = phoneMatches[0];
+                let phoneDigits = rawPhone.replace(/[^\d+]/g, '');
+                if (phoneDigits.length === 10) {
+                    phoneDigits = `+1${phoneDigits}`;
                 }
-                if (phone.length === 11 && phone.startsWith('1')) {
-                    phone = phone.substring(1);
+                if (phoneDigits.length === 11 && phoneDigits.startsWith('1')) {
+                    phoneDigits = phoneDigits.substring(1);
                 }
-                if (phone.length === 10) {
-                    contact.phone = `+1 (${phone.substring(0,3)}) ${phone.substring(3,6)}-${phone.substring(6)}`;
+                if (phoneDigits.length === 10) {
+                    contact.phone = `+1 (${phoneDigits.substring(0,3)}) ${phoneDigits.substring(3,6)}-${phoneDigits.substring(6)}`;
                 } else {
-                    contact.phone = phoneMatches[0];
+                    contact.phone = rawPhone;
                 }
             }
-            
+
             const titleKeywords = ['ceo', 'cto', 'cfo', 'president', 'director', 'manager', 'lead', 'senior', 'junior', 'associate', 'consultant', 'analyst', 'specialist', 'coordinator', 'supervisor', 'executive', 'officer'];
             const companyKeywords = ['inc', 'llc', 'corp', 'company', 'ltd', 'limited', 'corporation', 'group', 'solutions', 'services', 'consulting', 'partners', 'associates'];
-            
+
             for (let i = 0; i < lines.length; i++) {
                 const line = lines[i];
                 const lowerLine = line.toLowerCase();
-                
+                const wordCount = line.split(' ').length;
+                const looksLikeName = wordCount >= 2 && wordCount <= 5 &&
+                    !/\d/.test(line) &&
+                    !lowerLine.includes('www') &&
+                    !lowerLine.includes('.com');
+
+                if (looksLikeName && !emailRegex.test(line) && !phoneRegex.test(line)) {
+                    candidateNameLines.push(line);
+                }
+
                 if (emailRegex.test(line) || phoneRegex.test(line) || line.length < 2 || /^\d+$/.test(line)) {
                     continue;
                 }
-                
+
                 const namePattern = /^[A-Za-z]+(?:\s[A-Za-z]+)+$/;
-                if (namePattern.test(line) && !contact.name && line.split(' ').length >= 2 && line.split(' ').length <= 4) {
+                if (namePattern.test(line) && !contact.name && wordCount >= 2 && wordCount <= 4) {
                     const hasCommonTitle = titleKeywords.some(keyword => lowerLine.includes(keyword));
                     const hasCompanyIndicator = companyKeywords.some(keyword => lowerLine.includes(keyword));
-                    
+
                     if (!hasCommonTitle && !hasCompanyIndicator) {
                         contact.name = line;
                         continue;
                     }
                 }
-                
+
                 if (titleKeywords.some(keyword => lowerLine.includes(keyword)) && !contact.title) {
                     contact.title = line;
                     continue;
                 }
-                
+
                 if (companyKeywords.some(keyword => lowerLine.includes(keyword)) && !contact.company) {
                     contact.company = line;
                     continue;
                 }
-                
-                if (!contact.name && line.split(' ').length >= 2 && line.split(' ').length <= 3 && 
-                    !lowerLine.includes('www') && !lowerLine.includes('.com') && 
-                    !/\d/.test(line) && line.length > 5) {
+
+                if (!contact.name && looksLikeName) {
                     contact.name = line;
                 }
             }
-            
+
             if (!contact.name) {
                 for (const line of lines) {
-                    if (line.length > 3 && line.length < 40 && 
+                    if (line.length > 3 && line.length < 40 &&
                         !emailRegex.test(line) && !phoneRegex.test(line) &&
-                        !line.toLowerCase().includes('www') && 
+                        !line.toLowerCase().includes('www') &&
                         !/^\d+/.test(line) &&
                         line.split(' ').length >= 2) {
                         contact.name = line;
@@ -1333,7 +1765,7 @@ Design City, NY 10001`,
                     }
                 }
             }
-            
+
             if (!contact.name && lines.length > 0) {
                 for (let i = 0; i < Math.min(3, lines.length); i++) {
                     const line = lines[i];
@@ -1343,13 +1775,37 @@ Design City, NY 10001`,
                     }
                 }
             }
-            
+
+            if (contact.email) {
+                const emailCandidate = candidateNameFromEmail(contact.email);
+                if (emailCandidate) {
+                    candidateNameLines.push(emailCandidate);
+                }
+            }
+
+            const refinedName = tryParseNameWithHumanParser(candidateNameLines, contact.name);
+            if (refinedName) {
+                contact.name = refinedName;
+            }
+
+            if (rawPhone) {
+                const formattedPhone = formatPhoneNumberWithLib(rawPhone);
+                if (formattedPhone) {
+                    contact.phone = formattedPhone;
+                }
+            }
+
+            const parsedAddress = extractAddressFromLines(lines);
+            if (parsedAddress) {
+                contact.address = parsedAddress;
+            }
+
             Object.keys(contact).forEach(key => {
-                if (contact[key]) {
+                if (typeof contact[key] === 'string' && contact[key]) {
                     contact[key] = contact[key].trim();
                 }
             });
-            
+
             return contact;
         }
 
@@ -1402,9 +1858,10 @@ Design City, NY 10001`,
 
         async function performOCR(imageDataUrl) {
             try {
+                await ensureFieldParsers();
                 const text = await simulateOCRProcessing(imageDataUrl);
                 const contactInfo = extractContactInfo(text);
-                
+
                 setTimeout(() => {
                     displayExtractedInfo(contactInfo);
                 }, 300);
@@ -1437,6 +1894,12 @@ Design City, NY 10001`,
                     <span class="info-label">Phone:</span>
                     <span class="info-value">${data.phone}</span>
                 </div>
+                ${data.address ? `
+                <div class="info-item">
+                    <span class="info-label">Address:</span>
+                    <span class="info-value">${data.address.replace(/\n/g, '<br>')}</span>
+                </div>
+                ` : ''}
                 ${data.company ? `
                 <div class="info-item">
                     <span class="info-label">Company:</span>
@@ -1463,6 +1926,7 @@ Design City, NY 10001`,
                 name: extractedContactData.name,
                 email: extractedContactData.email,
                 phone: extractedContactData.phone,
+                address: extractedContactData.address || '',
                 company: extractedContactData.company || '',
                 title: extractedContactData.title || '',
                 lastContact: new Date().toISOString().split('T')[0],
@@ -1536,6 +2000,7 @@ Design City, NY 10001`,
         displayPagination();
         setupDragAndDrop();
         updateTagFilters();
+        ensureFieldParsers();
     </script>
 </body>
 </html>
