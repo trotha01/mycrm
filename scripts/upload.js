@@ -138,7 +138,8 @@ async function processBusinessCard(fileList) {
                 ...image,
                 text: recognition.text,
                 confidence: recognition.confidence,
-                engineUsed: recognition.engineUsed
+                engineUsed: recognition.engineUsed,
+                variantUsed: recognition.variantType
             });
             if (typeof recognition.confidence === 'number') {
                 totalConfidence += recognition.confidence;
@@ -223,6 +224,10 @@ function displayExtractedInfo(parsedInfo, recognitionResults) {
                     <span class="segment-side">${segment.side.toUpperCase()} SIDE</span>
                     <span class="segment-confidence">${segment.confidence != null ? `${segment.confidence.toFixed(2)}%` : '—'} (${segment.engine})</span>
                 </div>
+                ${segment.variant ? `
+                    <span class="info-label">Variant</span>
+                    <span class="info-value">${segment.variant}</span>
+                ` : ''}
                 <span class="info-label">Text</span>
                 <span class="info-value" style="white-space: pre-wrap; text-align: left;">${segment.text || '—'}</span>
             </div>

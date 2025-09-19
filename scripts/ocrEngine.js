@@ -33,10 +33,64 @@ const ppocrModelManifest = {
 
 let ppocrInitialized = false;
 
+let openCvReadyPromise = null;
+
 export function resetOcrEngine() {
     const preferred = resolvePreferredEngine();
     ocrConfig.engine = preferred;
     ocrConfig.currentEngine = preferred;
+}
+
+async function ensureOpenCVReady() {
+    if (typeof window === 'undefined') {
+        throw new Error('OpenCV preprocessing requires a browser environment.');
+    }
+
+    if (window.cv && typeof window.cv.Mat === 'function') {
+        return window.cv;
+    }
+
+    if (!openCvReadyPromise) {
+        openCvReadyPromise = (async () => {
+            await loadScriptOnce('opencv', 'https://docs.opencv.org/4.9.0/opencv.js', { crossOrigin: 'anonymous' });
+            await waitForOpenCVRuntime();
+            return window.cv;
+        })().catch(error => {
+            openCvReadyPromise = null;
+            throw error;
+        });
+    }
+
+    await openCvReadyPromise;
+    return window.cv;
+}
+
+function waitForOpenCVRuntime() {
+    if (window.cv && typeof window.cv.Mat === 'function') {
+        return Promise.resolve();
+    }
+
+    return new Promise((resolve, reject) => {
+        let attempts = 0;
+        const maxAttempts = 200;
+
+        const check = () => {
+            if (window.cv && typeof window.cv.Mat === 'function') {
+                resolve();
+                return;
+            }
+
+            attempts += 1;
+            if (attempts > maxAttempts) {
+                reject(new Error('OpenCV runtime failed to initialize in time.'));
+                return;
+            }
+
+            window.setTimeout(check, 25);
+        };
+
+        check();
+    });
 }
 
 export async function ensureFieldParsers() {
@@ -103,7 +157,7 @@ async function ensurePPOCREngine() {
     }
 
     await Promise.all([
-        loadScriptOnce('opencv', 'https://docs.opencv.org/4.9.0/opencv.js', { crossOrigin: 'anonymous' }),
+        ensureOpenCVReady(),
         loadScriptOnce('ort', 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js', { crossOrigin: 'anonymous' })
     ]);
 
@@ -116,25 +170,121 @@ async function ensurePPOCREngine() {
     ppocrInitialized = true;
 }
 
-export async function runOCREngine(imageDataUrl, label, progressCallback) {
-    if (ocrConfig.currentEngine === 'ppocr') {
-        try {
-            await ensurePPOCREngine();
-            const ppocrResult = await runPPOCRInference(imageDataUrl, progressCallback);
-            if (!ppocrResult.text || (ppocrResult.confidence || 0) < ocrConfig.confidenceThreshold * 100) {
-                throw new Error('PP-OCR confidence below threshold');
-            }
-            return { ...ppocrResult, engineUsed: 'ppocr' };
-        } catch (error) {
-            console.warn('PP-OCR failed, switching to Tesseract.js fallback.', error);
-            ocrConfig.currentEngine = ocrConfig.fallbackEngine;
-            return runOCREngine(imageDataUrl, label, progressCallback);
+export async function runOCREngine(imageInput, label, progressCallback) {
+    const variants = normalizePreprocessedVariants(imageInput);
+    let bestResult = null;
+
+    const share = 100 / variants.length;
+
+    for (let index = 0; index < variants.length; index += 1) {
+        const variant = variants[index];
+        const base = share * index;
+
+        if (progressCallback) {
+            progressCallback(Math.round(base));
+        }
+
+        const variantProgress = progressCallback
+            ? percentage => {
+                  const adjusted = Math.min(100, Math.round(base + (percentage / 100) * share));
+                  progressCallback(adjusted);
+              }
+            : undefined;
+
+        const recognition = await recognizeWithConfiguredEngines(variant.dataUrl, label, variantProgress);
+
+        if (progressCallback) {
+            progressCallback(Math.round(Math.min(100, base + share)));
+        }
+
+        const candidate = { ...recognition, variantType: variant.type };
+
+        if (!bestResult || (candidate.confidence || 0) > (bestResult.confidence || 0)) {
+            bestResult = candidate;
         }
     }
 
+    return bestResult || { text: '', confidence: 0, engineUsed: ocrConfig.currentEngine, variantType: variants[0]?.type };
+}
+
+function normalizePreprocessedVariants(imageInput) {
+    const variants = [];
+
+    if (typeof imageInput === 'string') {
+        variants.push({ type: 'original', dataUrl: imageInput });
+    } else if (imageInput && typeof imageInput === 'object') {
+        if (Array.isArray(imageInput.variants)) {
+            imageInput.variants.forEach(variant => {
+                if (variant && typeof variant.dataUrl === 'string' && variant.dataUrl.length > 0) {
+                    variants.push({ type: variant.type || 'variant', dataUrl: variant.dataUrl });
+                }
+            });
+        }
+
+        if (!variants.length) {
+            if (typeof imageInput.clean === 'string') {
+                variants.push({ type: 'clean', dataUrl: imageInput.clean });
+            }
+            if (typeof imageInput.thresholded === 'string') {
+                variants.push({ type: 'thresholded', dataUrl: imageInput.thresholded });
+            }
+        }
+
+        if (!variants.length && typeof imageInput.dataUrl === 'string') {
+            variants.push({ type: 'processed', dataUrl: imageInput.dataUrl });
+        }
+    }
+
+    if (!variants.length) {
+        throw new Error('No image data provided for OCR.');
+    }
+
+    const seen = new Set();
+    return variants.filter(variant => {
+        if (seen.has(variant.dataUrl)) {
+            return false;
+        }
+        seen.add(variant.dataUrl);
+        return true;
+    });
+}
+
+async function recognizeWithConfiguredEngines(dataUrl, label, progressCallback) {
+    const attempted = new Set();
+    let engine = ocrConfig.currentEngine;
+
+    while (!attempted.has(engine)) {
+        attempted.add(engine);
+
+        if (engine === 'ppocr') {
+            try {
+                await ensurePPOCREngine();
+                const ppocrResult = await runPPOCRInference(dataUrl, progressCallback);
+                const confidence = ppocrResult?.confidence || 0;
+                if (!ppocrResult?.text || confidence < ocrConfig.confidenceThreshold * 100) {
+                    throw new Error('PP-OCR confidence below threshold');
+                }
+                return { ...ppocrResult, engineUsed: 'ppocr' };
+            } catch (error) {
+                console.warn(`PP-OCR failed for ${label || 'image'}, switching to fallback.`, error);
+                engine = ocrConfig.fallbackEngine;
+                ocrConfig.currentEngine = engine;
+            }
+        } else {
+            const result = await recognizeWithTesseract(dataUrl, progressCallback);
+            return { ...result, engineUsed: 'tesseract' };
+        }
+    }
+
+    const fallbackResult = await recognizeWithTesseract(dataUrl, progressCallback);
+    ocrConfig.currentEngine = 'tesseract';
+    return { ...fallbackResult, engineUsed: 'tesseract' };
+}
+
+async function recognizeWithTesseract(dataUrl, progressCallback) {
     await ensureTesseract();
 
-    const result = await window.Tesseract.recognize(imageDataUrl, 'eng', {
+    const result = await window.Tesseract.recognize(dataUrl, 'eng', {
         logger: message => {
             if (progressCallback && message.status === 'recognizing text') {
                 const percentage = Math.round((message.progress || 0) * 100);
@@ -145,33 +295,349 @@ export async function runOCREngine(imageDataUrl, label, progressCallback) {
 
     return {
         text: result.data?.text || '',
-        confidence: result.data?.confidence || 0,
-        engineUsed: 'tesseract'
+        confidence: result.data?.confidence || 0
     };
 }
 
 export async function preprocessImage(dataUrl) {
+    try {
+        const cv = await ensureOpenCVReady();
+        return await preprocessWithOpenCV(cv, dataUrl);
+    } catch (error) {
+        console.warn('Falling back to canvas preprocessing because OpenCV is unavailable.', error);
+        return preprocessWithCanvas(dataUrl);
+    }
+}
+
+async function preprocessWithOpenCV(cv, dataUrl) {
+    const imageElement = await loadImageElement(dataUrl);
+    const src = cv.imread(imageElement);
+    let warpedResult = null;
+
+    try {
+        const region = detectCardRegion(cv, src);
+        warpedResult = warpCardToTopDown(cv, src, region.points);
+        const variants = generateNormalizedVariants(cv, warpedResult.warped);
+
+        const meta = {
+            crop: region.points,
+            orderedCrop: warpedResult.ordered,
+            size: { width: warpedResult.targetWidth, height: warpedResult.targetHeight }
+        };
+
+        if (warpedResult && warpedResult.warped) {
+            warpedResult.warped.delete();
+            warpedResult.warped = null;
+        }
+
+        return createPreprocessResult(variants.cleanDataUrl, variants.thresholdDataUrl, meta);
+    } finally {
+        if (warpedResult && warpedResult.warped) {
+            warpedResult.warped.delete();
+        }
+        src.delete();
+    }
+}
+
+async function preprocessWithCanvas(dataUrl) {
+    const image = await loadImageElement(dataUrl);
+    const canvas = document.createElement('canvas');
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const context = canvas.getContext('2d');
+    context.drawImage(image, 0, 0);
+
+    const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+    const grayscaleValues = new Float32Array((imageData.data.length / 4) | 0);
+    const { data } = imageData;
+
+    for (let i = 0, pixel = 0; i < data.length; i += 4, pixel += 1) {
+        const grayscale = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        grayscaleValues[pixel] = grayscale;
+        data[i] = data[i + 1] = data[i + 2] = grayscale;
+    }
+
+    context.putImageData(imageData, 0, 0);
+    const cleanDataUrl = canvas.toDataURL('image/png');
+
+    const thresholdCanvas = document.createElement('canvas');
+    thresholdCanvas.width = canvas.width;
+    thresholdCanvas.height = canvas.height;
+    const thresholdContext = thresholdCanvas.getContext('2d');
+    const thresholdData = thresholdContext.createImageData(thresholdCanvas.width, thresholdCanvas.height);
+    const thresholdBuffer = thresholdData.data;
+
+    const { mean, stddev } = computeValueStats(grayscaleValues);
+    const adaptiveThreshold = Math.max(60, Math.min(200, mean - stddev * 0.3));
+
+    for (let i = 0, pixel = 0; i < thresholdBuffer.length; i += 4, pixel += 1) {
+        const value = grayscaleValues[pixel] > adaptiveThreshold ? 255 : 0;
+        thresholdBuffer[i] = thresholdBuffer[i + 1] = thresholdBuffer[i + 2] = value;
+        thresholdBuffer[i + 3] = 255;
+    }
+
+    thresholdContext.putImageData(thresholdData, 0, 0);
+    const thresholdedDataUrl = thresholdCanvas.toDataURL('image/png');
+
+    return createPreprocessResult(cleanDataUrl, thresholdedDataUrl, {
+        fallback: true,
+        size: { width: canvas.width, height: canvas.height }
+    });
+}
+
+function detectCardRegion(cv, src) {
+    const maxDimension = Math.max(src.cols, src.rows);
+    const scale = maxDimension > 800 ? 800 / maxDimension : 1;
+    const resizedWidth = Math.max(1, Math.round(src.cols * scale));
+    const resizedHeight = Math.max(1, Math.round(src.rows * scale));
+    const resizedSize = new cv.Size(resizedWidth, resizedHeight);
+    let resized;
+
+    if (scale !== 1) {
+        resized = new cv.Mat();
+        cv.resize(src, resized, resizedSize, 0, 0, cv.INTER_AREA);
+    } else {
+        resized = src.clone();
+    }
+
+    const gray = new cv.Mat();
+    cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY, 0);
+
+    const blurred = new cv.Mat();
+    cv.GaussianBlur(gray, blurred, new cv.Size(5, 5), 0);
+
+    const edged = new cv.Mat();
+    cv.Canny(blurred, edged, 75, 200);
+
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(edged, contours, hierarchy, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+    let bestPoints = null;
+    let bestArea = 0;
+    const minimumArea = resized.cols * resized.rows * 0.25;
+
+    for (let i = 0; i < contours.size(); i += 1) {
+        const contour = contours.get(i);
+        const contourArea = cv.contourArea(contour);
+        if (contourArea < minimumArea) {
+            contour.delete();
+            continue;
+        }
+
+        const perimeter = cv.arcLength(contour, true);
+        const approx = new cv.Mat();
+        cv.approxPolyDP(contour, approx, 0.02 * perimeter, true);
+
+        if (approx.rows === 4 && contourArea > bestArea) {
+            bestArea = contourArea;
+            const points = [];
+            const data = approx.data32S;
+            for (let j = 0; j < data.length; j += 2) {
+                points.push({
+                    x: data[j] / scale,
+                    y: data[j + 1] / scale
+                });
+            }
+            bestPoints = points;
+        }
+
+        approx.delete();
+        contour.delete();
+    }
+
+    hierarchy.delete();
+    contours.delete();
+    edged.delete();
+    blurred.delete();
+    gray.delete();
+    resized.delete();
+
+    if (bestPoints && bestPoints.length === 4) {
+        return { points: bestPoints };
+    }
+
+    return {
+        points: [
+            { x: 0, y: 0 },
+            { x: src.cols - 1, y: 0 },
+            { x: src.cols - 1, y: src.rows - 1 },
+            { x: 0, y: src.rows - 1 }
+        ]
+    };
+}
+
+function warpCardToTopDown(cv, src, points) {
+    const { ordered, targetWidth, targetHeight } = computeWarpTargets(points);
+    const srcCoordinates = flattenPoints(ordered);
+    const dstCoordinates = [
+        0, 0,
+        targetWidth - 1, 0,
+        targetWidth - 1, targetHeight - 1,
+        0, targetHeight - 1
+    ];
+
+    const srcMat = cv.matFromArray(4, 1, cv.CV_32FC2, srcCoordinates);
+    const dstMat = cv.matFromArray(4, 1, cv.CV_32FC2, dstCoordinates);
+    const transform = cv.getPerspectiveTransform(srcMat, dstMat);
+    const warped = new cv.Mat();
+
+    cv.warpPerspective(src, warped, transform, new cv.Size(targetWidth, targetHeight), cv.INTER_CUBIC, cv.BORDER_REPLICATE);
+
+    srcMat.delete();
+    dstMat.delete();
+    transform.delete();
+
+    return { warped, ordered, targetWidth, targetHeight };
+}
+
+function computeWarpTargets(points) {
+    const ordered = orderContourPoints(points);
+
+    const widthA = distanceBetween(ordered[2], ordered[3]);
+    const widthB = distanceBetween(ordered[1], ordered[0]);
+    const rawWidth = Math.max(widthA, widthB, 1);
+
+    const heightA = distanceBetween(ordered[1], ordered[2]);
+    const heightB = distanceBetween(ordered[0], ordered[3]);
+    const rawHeight = Math.max(heightA, heightB, 1);
+
+    const preferredWidth = 1400;
+    const minWidth = 1050;
+    const maxWidth = 1800;
+
+    let targetWidth = rawWidth;
+    if (targetWidth < minWidth) {
+        targetWidth = minWidth;
+    }
+    if (targetWidth < preferredWidth) {
+        targetWidth = preferredWidth;
+    }
+    if (targetWidth > maxWidth) {
+        targetWidth = maxWidth;
+    }
+
+    const scale = targetWidth / rawWidth;
+    let targetHeight = Math.round(rawHeight * scale);
+
+    const minHeight = 600;
+    const maxHeight = 1200;
+    if (targetHeight < minHeight) {
+        targetHeight = minHeight;
+    }
+    if (targetHeight > maxHeight) {
+        targetHeight = maxHeight;
+    }
+
+    return { ordered, targetWidth: Math.round(targetWidth), targetHeight };
+}
+
+function orderContourPoints(points) {
+    const sumSorted = [...points].sort((a, b) => a.x + a.y - (b.x + b.y));
+    const diffSorted = [...points].sort((a, b) => a.y - a.x - (b.y - b.x));
+
+    const topLeft = sumSorted[0];
+    const bottomRight = sumSorted[sumSorted.length - 1];
+    const topRight = diffSorted[0];
+    const bottomLeft = diffSorted[diffSorted.length - 1];
+
+    return [topLeft, topRight, bottomRight, bottomLeft];
+}
+
+function distanceBetween(pointA, pointB) {
+    return Math.hypot(pointA.x - pointB.x, pointA.y - pointB.y);
+}
+
+function flattenPoints(points) {
+    const coordinates = [];
+    points.forEach(point => {
+        coordinates.push(point.x, point.y);
+    });
+    return coordinates;
+}
+
+function generateNormalizedVariants(cv, warped) {
+    const gray = new cv.Mat();
+    cv.cvtColor(warped, gray, cv.COLOR_RGBA2GRAY, 0);
+
+    const denoised = new cv.Mat();
+    cv.bilateralFilter(gray, denoised, 9, 75, 75);
+
+    const claheMat = new cv.Mat();
+    const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+    clahe.apply(denoised, claheMat);
+    clahe.delete();
+
+    const smoothed = new cv.Mat();
+    cv.medianBlur(claheMat, smoothed, 3);
+
+    const cleanDataUrl = matToDataUrl(cv, smoothed);
+
+    const thresholdMat = new cv.Mat();
+    cv.adaptiveThreshold(smoothed, thresholdMat, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 31, 10);
+    const thresholdDataUrl = matToDataUrl(cv, thresholdMat);
+
+    gray.delete();
+    denoised.delete();
+    claheMat.delete();
+    thresholdMat.delete();
+    smoothed.delete();
+
+    return { cleanDataUrl, thresholdDataUrl };
+}
+
+function createPreprocessResult(cleanDataUrl, thresholdDataUrl, meta = {}) {
+    const variants = [];
+
+    if (cleanDataUrl) {
+        variants.push({ type: 'clean', dataUrl: cleanDataUrl });
+    }
+    if (thresholdDataUrl && thresholdDataUrl !== cleanDataUrl) {
+        variants.push({ type: 'thresholded', dataUrl: thresholdDataUrl });
+    }
+
+    if (!variants.length && cleanDataUrl) {
+        variants.push({ type: 'processed', dataUrl: cleanDataUrl });
+    }
+
+    return {
+        clean: cleanDataUrl,
+        thresholded: thresholdDataUrl,
+        defaultVariant: variants[0]?.type || 'clean',
+        variants,
+        meta
+    };
+}
+
+function loadImageElement(dataUrl) {
     return new Promise((resolve, reject) => {
         const image = new Image();
-        image.onload = () => {
-            const canvas = document.createElement('canvas');
-            canvas.width = image.width;
-            canvas.height = image.height;
-            const context = canvas.getContext('2d');
-            context.drawImage(image, 0, 0);
-
-            const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
-            const { data } = imageData;
-            for (let i = 0; i < data.length; i += 4) {
-                const grayscale = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-                data[i] = data[i + 1] = data[i + 2] = grayscale;
-            }
-            context.putImageData(imageData, 0, 0);
-            resolve(canvas.toDataURL('image/png'));
-        };
+        image.onload = () => resolve(image);
         image.onerror = reject;
         image.src = dataUrl;
     });
+}
+
+function matToDataUrl(cv, mat) {
+    const canvas = document.createElement('canvas');
+    cv.imshow(canvas, mat);
+    return canvas.toDataURL('image/png');
+}
+
+function computeValueStats(values) {
+    let sum = 0;
+    let sumSquares = 0;
+
+    for (let i = 0; i < values.length; i += 1) {
+        const value = values[i];
+        sum += value;
+        sumSquares += value * value;
+    }
+
+    const mean = values.length ? sum / values.length : 0;
+    const variance = values.length ? Math.max(0, sumSquares / values.length - mean * mean) : 0;
+
+    return { mean, stddev: Math.sqrt(variance) };
 }
 
 export async function extractContactInfo(fullText, recognitionResults, averageConfidence) {
@@ -317,7 +783,8 @@ export function parseRecognitionSummary(recognitionResults) {
         side: result.label,
         text: (result.text || '').trim(),
         confidence: typeof result.confidence === 'number' ? Number(result.confidence.toFixed(2)) : null,
-        engine: result.engineUsed
+        engine: result.engineUsed,
+        variant: result.variantUsed || result.variantType || result.preprocessed?.defaultVariant || null
     }));
 }
 
