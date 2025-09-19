@@ -1,28 +1,42 @@
+function resolvePreferredEngine() {
+    try {
+        const stored = typeof window !== 'undefined' ? window.localStorage?.getItem('ocr.engine') : null;
+        if (stored === 'ppocr') {
+            return 'ppocr';
+        }
+    } catch (error) {
+        console.warn('Unable to read persisted OCR engine preference, defaulting to Tesseract.', error);
+    }
+    return 'tesseract';
+}
+
+const defaultEngine = resolvePreferredEngine();
+
 export const ocrConfig = {
-    engine: 'ppocr',
+    engine: defaultEngine,
     fallbackEngine: 'tesseract',
     confidenceThreshold: 0.58,
-    currentEngine: 'ppocr'
+    currentEngine: defaultEngine
 };
 
 const fieldParserScripts = {
-    libphonenumber: 'https://cdn.jsdelivr.net/npm/libphonenumber-js@1.10.25/bundle/libphonenumber-js.min.js',
-    humanparser: 'https://cdn.jsdelivr.net/npm/humanparser@2.2.7/humanparser.min.js',
-    parseAddress: 'https://cdn.jsdelivr.net/npm/parse-address@1.0.4/parse-address.min.js'
+    libphonenumber: 'https://cdn.jsdelivr.net/npm/libphonenumber-js@1.12.17/bundle/libphonenumber-max.js'
 };
 
 const scriptRegistry = new Map();
 const ocrModelBuffers = {};
 const ppocrModelManifest = {
-    detector: 'https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@release/2.6/inference/en/en_ppocr_mobile_v2.0_det_infer.onnx',
-    recognizer: 'https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@release/2.6/inference/en/en_ppocr_mobile_v2.0_rec_infer.onnx',
-    dictionary: 'https://cdn.jsdelivr.net/gh/PaddlePaddle/PaddleOCR@release/2.6/ppocr/utils/ppocr_keys_v1.txt'
+    detector: null,
+    recognizer: null,
+    dictionary: null
 };
 
 let ppocrInitialized = false;
 
 export function resetOcrEngine() {
-    ocrConfig.currentEngine = ocrConfig.engine;
+    const preferred = resolvePreferredEngine();
+    ocrConfig.engine = preferred;
+    ocrConfig.currentEngine = preferred;
 }
 
 export async function ensureFieldParsers() {
@@ -30,10 +44,14 @@ export async function ensureFieldParsers() {
         try {
             await loadScriptOnce(key, url, { crossOrigin: 'anonymous' });
         } catch (error) {
-            console.warn(`Failed to load ${key} parser`, error);
+            console.warn(`Failed to load ${key} parser from ${url}. Falling back to heuristic parsing.`, error);
         }
     });
     await Promise.all(loaders);
+
+    if (typeof window !== 'undefined' && !window.libphonenumber) {
+        console.warn('libphonenumber-js is unavailable; phone numbers will use regex-based parsing.');
+    }
 }
 
 export async function ensureTesseract() {
@@ -55,13 +73,37 @@ async function fetchModelBuffer(key, url) {
     return buffer;
 }
 
+function resolveManifestOverrides() {
+    if (typeof window === 'undefined') {
+        return;
+    }
+    const overrides = window.__PPOCR_MANIFEST__;
+    if (overrides && typeof overrides === 'object') {
+        Object.entries(overrides).forEach(([key, value]) => {
+            if (key in ppocrModelManifest && typeof value === 'string' && value.trim().length > 0) {
+                ppocrModelManifest[key] = value.trim();
+            }
+        });
+    }
+}
+
 async function ensurePPOCREngine() {
     if (ppocrInitialized) {
         return;
     }
 
+    resolveManifestOverrides();
+
+    const missingAssets = Object.entries(ppocrModelManifest)
+        .filter(([, value]) => typeof value !== 'string' || value.length === 0)
+        .map(([key]) => key);
+
+    if (missingAssets.length > 0) {
+        throw new Error(`PP-OCR assets missing: ${missingAssets.join(', ')}`);
+    }
+
     await Promise.all([
-        loadScriptOnce('opencv', 'https://cdn.jsdelivr.net/npm/opencv.js@4.8.0/opencv.js', { crossOrigin: 'anonymous' }),
+        loadScriptOnce('opencv', 'https://docs.opencv.org/4.9.0/opencv.js', { crossOrigin: 'anonymous' }),
         loadScriptOnce('ort', 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js', { crossOrigin: 'anonymous' })
     ]);
 
@@ -158,29 +200,48 @@ export async function extractContactInfo(fullText, recognitionResults, averageCo
         .map(line => line.trim())
         .filter(line => line.length > 0);
 
+    const normalizedLines = lines.map((line, index) => ({
+        index,
+        text: line,
+        lower: line.toLowerCase()
+    }));
+
+    const excludedForName = new Set();
+
     const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/gi;
     const emailMatch = fullText.match(emailRegex);
     if (emailMatch && emailMatch.length > 0) {
         info.email = emailMatch[0].toLowerCase();
+        normalizedLines.forEach(entry => {
+            if (entry.lower.includes(info.email)) {
+                excludedForName.add(entry.index);
+            }
+        });
     }
 
     const phoneParser = window.libphonenumber?.parsePhoneNumberFromString;
     if (phoneParser) {
-        for (const line of lines) {
-            const parsed = phoneParser(line, 'US');
-            if (parsed && parsed.isValid()) {
-                info.phone = parsed.formatInternational();
-                break;
+        for (const entry of normalizedLines) {
+            try {
+                const parsed = phoneParser(entry.text, 'US');
+                if (parsed && parsed.isValid()) {
+                    info.phone = parsed.formatInternational();
+                    excludedForName.add(entry.index);
+                    break;
+                }
+            } catch (error) {
+                // Ignore individual line parse failures and continue with fallbacks.
             }
         }
     }
 
     if (!info.phone) {
-        const fallbackLine = lines.find(line => /\d{3}[)\s.-]*\d{3}[\s.-]*\d{4}/.test(line));
+        const fallbackLine = normalizedLines.find(entry => /\d{3}[)\s.-]*\d{3}[\s.-]*\d{4}/.test(entry.text));
         if (fallbackLine) {
-            const match = fallbackLine.match(/\+?\d[\d\s().-]{7,}/);
+            const match = fallbackLine.text.match(/\+?\d[\d\s().-]{7,}/);
             if (match) {
                 info.phone = match[0];
+                excludedForName.add(fallbackLine.index);
             }
         }
     }
@@ -188,51 +249,43 @@ export async function extractContactInfo(fullText, recognitionResults, averageCo
     const titleKeywords = ['ceo', 'cto', 'cfo', 'president', 'director', 'manager', 'lead', 'senior', 'junior', 'associate', 'consultant', 'analyst', 'specialist', 'coordinator', 'supervisor', 'executive', 'officer', 'founder'];
     const companyKeywords = ['inc', 'llc', 'corp', 'company', 'ltd', 'limited', 'corporation', 'group', 'solutions', 'services', 'consulting', 'partners', 'associates', 'studio', 'labs'];
 
-    const nameParser = window.humanparser?.parseName;
-    for (const line of lines) {
-        const lower = line.toLowerCase();
-        if (info.email && line.includes(info.email)) continue;
-        if (info.phone && line.includes(info.phone.replace(/[^\d]/g, ''))) continue;
-
-        if (!info.title && titleKeywords.some(keyword => lower.includes(keyword))) {
-            info.title = line;
+    for (const entry of normalizedLines) {
+        if (excludedForName.has(entry.index)) {
             continue;
         }
 
-        if (!info.company && companyKeywords.some(keyword => lower.includes(keyword))) {
-            info.company = line;
+        if (!info.title && titleKeywords.some(keyword => entry.lower.includes(keyword))) {
+            info.title = entry.text;
+            excludedForName.add(entry.index);
             continue;
         }
 
-        if (!info.name && nameParser) {
-            const parsedName = nameParser(line);
-            if (parsedName && parsedName.firstName && parsedName.lastName) {
-                const parts = [parsedName.firstName, parsedName.middleName, parsedName.lastName]
-                    .filter(Boolean)
-                    .join(' ')
-                    .trim();
-                if (parts.length > 0) {
-                    info.name = parts;
-                    continue;
-                }
-            }
-        }
-
-        if (!info.name && /^[A-Za-z]+(?:\s[A-Za-z.'-]+){1,3}$/.test(line)) {
-            info.name = line;
+        if (!info.company && companyKeywords.some(keyword => entry.lower.includes(keyword))) {
+            info.company = entry.text;
+            excludedForName.add(entry.index);
         }
     }
 
+    const nameResult = inferNameFromLines(normalizedLines, excludedForName);
+    if (nameResult) {
+        info.name = nameResult.value;
+        nameResult.indices.forEach(index => excludedForName.add(index));
+    }
+
     if (!info.company) {
-        const fallbackCompany = lines.find(line => !line.includes(info.name) && !line.includes(info.email) && !/\d/.test(line) && line.length > 3);
+        const fallbackCompany = normalizedLines.find(entry => !excludedForName.has(entry.index) && !/\d/.test(entry.text) && entry.text.length > 3);
         if (fallbackCompany) {
-            info.company = fallbackCompany;
+            info.company = fallbackCompany.text;
         }
     }
 
     if (!info.name && info.email) {
         const emailPrefix = info.email.split('@')[0].replace(/[._]/g, ' ');
-        info.name = emailPrefix.split(' ').map(part => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+        info.name = emailPrefix
+            .split(' ')
+            .filter(Boolean)
+            .map(part => part.charAt(0).toUpperCase() + part.slice(1))
+            .join(' ');
     }
 
     const inferredTags = new Set();
@@ -251,6 +304,9 @@ export async function extractContactInfo(fullText, recognitionResults, averageCo
     if (info.company) {
         inferredTags.add('imported');
     }
+    if (info.engineUsed === 'tesseract') {
+        inferredTags.add('ocr:tesseract');
+    }
     info.tags = Array.from(inferredTags);
 
     return info;
@@ -263,6 +319,138 @@ export function parseRecognitionSummary(recognitionResults) {
         confidence: typeof result.confidence === 'number' ? Number(result.confidence.toFixed(2)) : null,
         engine: result.engineUsed
     }));
+}
+
+function inferNameFromLines(lines, excludedIndices) {
+    const sanitized = lines
+        .filter(entry => !excludedIndices.has(entry.index))
+        .map(entry => ({
+            index: entry.index,
+            tokens: entry.text.split(/\s+/).filter(Boolean)
+        }))
+        .filter(entry => entry.tokens.length > 0 && entry.tokens.length <= 4);
+
+    const candidates = [];
+
+    for (let i = 0; i < sanitized.length; i += 1) {
+        const current = sanitized[i];
+        const singleLineCandidate = buildNameCandidate(current);
+        if (singleLineCandidate) {
+            candidates.push(singleLineCandidate);
+        }
+
+        const next = sanitized[i + 1];
+        if (next && next.index === current.index + 1) {
+            const combinedCandidate = buildNameCandidate({
+                index: current.index,
+                tokens: [...current.tokens, ...next.tokens],
+                indices: [current.index, next.index]
+            });
+            if (combinedCandidate) {
+                candidates.push(combinedCandidate);
+            }
+        }
+    }
+
+    if (candidates.length === 0) {
+        return null;
+    }
+
+    candidates.sort((a, b) => {
+        if (b.score !== a.score) {
+            return b.score - a.score;
+        }
+        return a.indices[0] - b.indices[0];
+    });
+
+    return candidates[0];
+}
+
+function buildNameCandidate(entry) {
+    const indices = entry.indices || [entry.index];
+    const normalizedTokens = entry.tokens
+        .map(normalizeNameToken)
+        .filter(Boolean);
+
+    if (normalizedTokens.length < 2 || normalizedTokens.length > 4) {
+        return null;
+    }
+
+    if (!normalizedTokens.every(isLikelyNameToken)) {
+        return null;
+    }
+
+    const formattedTokens = normalizedTokens.map(formatNameToken);
+    const score = scoreNameTokens(normalizedTokens, indices.length > 1);
+
+    return {
+        value: formattedTokens.join(' '),
+        indices,
+        score
+    };
+}
+
+function scoreNameTokens(tokens, isMultiline) {
+    let score = tokens.length * 2;
+    if (isMultiline) {
+        score += 0.5;
+    }
+    if (tokens.every(token => /^[A-Z][a-zA-Z'.-]*$/.test(token))) {
+        score += 0.25;
+    }
+    if (tokens.some(token => /^[A-Z]{2,}$/.test(token))) {
+        score -= 0.2;
+    }
+    if (tokens.some(token => token.length === 1)) {
+        score -= 0.1;
+    }
+    return score;
+}
+
+function formatNameToken(token) {
+    if (/^[A-Z]{2,}$/.test(token)) {
+        return token.charAt(0) + token.slice(1).toLowerCase();
+    }
+    if (/^[A-Z]\.$/.test(token)) {
+        return token.toUpperCase();
+    }
+    if (/^[A-Z][a-zA-Z'.-]*$/.test(token)) {
+        return token;
+    }
+    return token.replace(/^[a-z]/, char => char.toUpperCase());
+}
+
+function normalizeNameToken(token) {
+    const cleaned = token.replace(/^[^A-Za-z]+|[^A-Za-z'.-]+$/g, '');
+    if (!cleaned) {
+        return '';
+    }
+    if (/^[A-Z]{2,}$/.test(cleaned)) {
+        return cleaned;
+    }
+    if (/^[A-Z][a-zA-Z'.-]*$/.test(cleaned)) {
+        return cleaned;
+    }
+    if (/^[a-z][a-z'.-]*$/.test(cleaned)) {
+        return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
+    }
+    if (/^[A-Z]\.$/.test(cleaned)) {
+        return cleaned.toUpperCase();
+    }
+    return '';
+}
+
+function isLikelyNameToken(token) {
+    if (!token) {
+        return false;
+    }
+    if (/[@\d]/.test(token)) {
+        return false;
+    }
+    if (token.length === 1) {
+        return /^[A-Z]$/.test(token);
+    }
+    return /^[A-Z][A-Za-z'.-]*$/.test(token) || /^[A-Z]{2,}$/.test(token);
 }
 
 async function runPPOCRInference() {
@@ -278,6 +466,7 @@ async function loadScriptOnce(key, url, attributes = {}) {
         const script = document.createElement('script');
         script.src = url;
         script.async = true;
+        script.type = 'text/javascript';
         Object.entries(attributes).forEach(([attr, value]) => {
             if (value != null) {
                 script.setAttribute(attr, value);
