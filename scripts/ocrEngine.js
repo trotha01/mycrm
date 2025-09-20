@@ -34,6 +34,7 @@ const ppocrModelManifest = {
 let ppocrInitialized = false;
 
 let openCvReadyPromise = null;
+const defaultOpenCvScript = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-wasm/opencv.js';
 
 export function resetOcrEngine() {
     const preferred = resolvePreferredEngine();
@@ -52,7 +53,12 @@ async function ensureOpenCVReady() {
 
     if (!openCvReadyPromise) {
         openCvReadyPromise = (async () => {
-            await loadScriptOnce('opencv', 'https://docs.opencv.org/4.9.0/opencv.js', { crossOrigin: 'anonymous' });
+            const scriptUrl = (typeof window !== 'undefined' &&
+                window.__OCR_ASSETS__ &&
+                typeof window.__OCR_ASSETS__.opencvScript === 'string'
+                    ? window.__OCR_ASSETS__.opencvScript
+                    : defaultOpenCvScript);
+            await loadScriptOnce('opencv', scriptUrl, { crossOrigin: 'anonymous' });
             await waitForOpenCVRuntime();
             return window.cv;
         })().catch(error => {
