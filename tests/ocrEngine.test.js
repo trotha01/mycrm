@@ -56,3 +56,41 @@ describe('runOCREngine', () => {
     expect(appendSpy).toHaveBeenCalled();
   });
 });
+
+describe('TensorFlow backend recovery', () => {
+  let appendSpy;
+
+  beforeEach(() => {
+    appendSpy = vi.spyOn(document.head, 'appendChild').mockImplementation(node => {
+      if (node.tagName === 'SCRIPT' && typeof node.onload === 'function') {
+        setTimeout(() => node.onload(), 0);
+      }
+      return node;
+    });
+  });
+
+  afterEach(() => {
+    appendSpy.mockRestore();
+  });
+
+  it('retries tfjs backend from wasm-out when dist path 404s', async () => {
+    const failingScript = document.createElement('script');
+    failingScript.src = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.16.0/dist/tfjs-backend-wasm.js';
+
+    const event = new Event('error', { cancelable: true });
+    Object.defineProperty(event, 'target', { value: failingScript });
+    const preventDefaultSpy = vi.spyOn(event, 'preventDefault');
+
+    window.dispatchEvent(event);
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const fallbackCall = appendSpy.mock.calls.find(([node]) =>
+      node.tagName === 'SCRIPT' && node.src.includes('/wasm-out/tfjs-backend-wasm.js')
+    );
+
+    expect(preventDefaultSpy).toHaveBeenCalled();
+    expect(fallbackCall).toBeTruthy();
+  });
+});

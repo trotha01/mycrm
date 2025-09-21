@@ -35,6 +35,10 @@ let ppocrInitialized = false;
 
 let openCvReadyPromise = null;
 const defaultOpenCvScript = 'https://cdn.jsdelivr.net/npm/@techstark/opencv-js@4.9.0-wasm/opencv.js';
+const defaultTfjsBackendScript = 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.16.0/wasm-out/tfjs-backend-wasm.js';
+const tfBackendFallbackKey = 'tfjs-backend-wasm';
+
+installTensorflowBackendRecovery();
 
 export function resetOcrEngine() {
     const preferred = resolvePreferredEngine();
@@ -924,6 +928,88 @@ function isLikelyNameToken(token) {
         return /^[A-Z]$/.test(token);
     }
     return /^[A-Z][A-Za-z'.-]*$/.test(token) || /^[A-Z]{2,}$/.test(token);
+}
+
+function installTensorflowBackendRecovery() {
+    if (typeof window === 'undefined') {
+        return;
+    }
+
+    if (window.__tfBackendRecoveryInstalled) {
+        return;
+    }
+
+    window.__tfBackendRecoveryInstalled = true;
+
+    window.addEventListener(
+        'error',
+        event => {
+            const target = event?.target;
+            if (!shouldHandleTensorflowScriptError(target)) {
+                return;
+            }
+
+            if (typeof event.preventDefault === 'function') {
+                event.preventDefault();
+            }
+            if (typeof event.stopPropagation === 'function') {
+                event.stopPropagation();
+            }
+            if (typeof event.stopImmediatePropagation === 'function') {
+                event.stopImmediatePropagation();
+            }
+
+            const failingSrc = target?.src || '';
+            const fallbackUrl = resolveTensorflowBackendUrl(failingSrc);
+
+            if (!fallbackUrl || fallbackUrl === failingSrc) {
+                return;
+            }
+
+            if (target?.parentNode && typeof target.parentNode.removeChild === 'function') {
+                target.parentNode.removeChild(target);
+            }
+
+            console.warn(
+                `TensorFlow WASM backend not found at ${failingSrc}. Retrying with ${fallbackUrl}.`
+            );
+
+            loadScriptOnce(tfBackendFallbackKey, fallbackUrl, { crossOrigin: 'anonymous' }).catch(error => {
+                console.error(`Failed to recover TensorFlow WASM backend from ${fallbackUrl}`, error);
+            });
+        },
+        true
+    );
+}
+
+function shouldHandleTensorflowScriptError(target) {
+    if (!target || target.tagName !== 'SCRIPT') {
+        return false;
+    }
+    const src = target.src || '';
+    if (!src) {
+        return false;
+    }
+    if (src.includes('/wasm-out/')) {
+        return false;
+    }
+    return src.includes('@tensorflow/tfjs-backend-wasm');
+}
+
+function resolveTensorflowBackendUrl(failingSrc) {
+    const override = typeof window !== 'undefined' && window.__OCR_ASSETS__
+        ? window.__OCR_ASSETS__.tfjsBackendScript
+        : null;
+
+    if (typeof override === 'string' && override.trim().length > 0) {
+        return override.trim();
+    }
+
+    if (typeof failingSrc === 'string' && failingSrc.includes('/dist/')) {
+        return failingSrc.replace('/dist/', '/wasm-out/');
+    }
+
+    return defaultTfjsBackendScript;
 }
 
 async function runPPOCRInference() {
