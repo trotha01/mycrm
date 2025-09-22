@@ -1,0 +1,347 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OCR Text Extractor</title>
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            color: #1f2933;
+        }
+
+        .container {
+            width: min(960px, 100%);
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 24px;
+            box-shadow: 0 30px 70px rgba(0, 0, 0, 0.15);
+            overflow: hidden;
+        }
+
+        header {
+            padding: 32px 40px 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        header h1 {
+            margin: 0 0 8px;
+            font-weight: 300;
+            font-size: clamp(2rem, 5vw, 2.6rem);
+        }
+
+        header p {
+            margin: 0;
+            opacity: 0.85;
+        }
+
+        .back-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 16px;
+            color: white;
+            text-decoration: none;
+            font-weight: 500;
+            background: rgba(255, 255, 255, 0.18);
+            padding: 8px 16px;
+            border-radius: 999px;
+            transition: background 0.3s ease, transform 0.3s ease;
+        }
+
+        .back-link:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-2px);
+        }
+
+        main {
+            padding: 32px 40px 40px;
+            display: grid;
+            gap: 32px;
+        }
+
+        .upload-card {
+            border: 1px solid rgba(102, 126, 234, 0.2);
+            border-radius: 18px;
+            padding: 30px;
+            background: white;
+        }
+
+        .upload-card h2 {
+            margin-top: 0;
+            font-weight: 500;
+            font-size: 1.3rem;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .upload-area {
+            margin-top: 20px;
+            padding: 30px;
+            border: 2px dashed #cbd5e0;
+            border-radius: 18px;
+            text-align: center;
+            background: #f8f9ff;
+            cursor: pointer;
+            transition: border-color 0.3s ease, background 0.3s ease;
+        }
+
+        .upload-area:hover {
+            border-color: #667eea;
+            background: #eef2ff;
+        }
+
+        .upload-area input {
+            display: none;
+        }
+
+        .upload-area strong {
+            display: block;
+            font-size: 1.1rem;
+            margin-bottom: 6px;
+        }
+
+        .preview {
+            margin-top: 20px;
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+        }
+
+        .preview img {
+            max-width: 250px;
+            max-height: 200px;
+            border-radius: 16px;
+            box-shadow: 0 12px 30px rgba(102, 126, 234, 0.25);
+        }
+
+        .actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 24px;
+            align-items: center;
+        }
+
+        button {
+            appearance: none;
+            border: none;
+            border-radius: 999px;
+            padding: 12px 26px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            box-shadow: 0 10px 25px rgba(102, 126, 234, 0.4);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        button:disabled {
+            background: linear-gradient(135deg, #a0aec0 0%, #cbd5e0 100%);
+            cursor: not-allowed;
+            box-shadow: none;
+        }
+
+        button:hover:not(:disabled) {
+            transform: translateY(-1px);
+            box-shadow: 0 16px 35px rgba(102, 126, 234, 0.5);
+        }
+
+        .status {
+            flex: 1;
+            min-width: 180px;
+            color: #475569;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 10px;
+            background: #e2e8f0;
+            border-radius: 999px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+
+        .progress-bar span {
+            display: block;
+            height: 100%;
+            width: 0;
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            transition: width 0.2s ease;
+        }
+
+        .results-card {
+            border: 1px solid rgba(102, 126, 234, 0.2);
+            border-radius: 18px;
+            padding: 30px;
+            background: white;
+            display: grid;
+            gap: 20px;
+        }
+
+        .results-card h3 {
+            margin: 0;
+            font-size: 1.2rem;
+            font-weight: 600;
+            color: #39456c;
+        }
+
+        textarea {
+            width: 100%;
+            min-height: 180px;
+            border-radius: 16px;
+            border: 1px solid #d2d6dc;
+            padding: 16px;
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+            font-size: 0.95rem;
+            background: #f9fafb;
+            resize: vertical;
+        }
+
+        .hints {
+            font-size: 0.9rem;
+            line-height: 1.5;
+            color: #475569;
+        }
+
+        @media (max-width: 720px) {
+            body {
+                padding: 12px;
+            }
+
+            header, main {
+                padding: 24px;
+            }
+
+            .upload-area {
+                padding: 24px;
+            }
+
+            .preview {
+                justify-content: center;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>OCR Text Extractor</h1>
+            <p>Upload an image to detect and extract text using Tesseract.js, right in your browser.</p>
+            <a class="back-link" href="index.html">← Back to CRM dashboard</a>
+        </header>
+        <main>
+            <section class="upload-card">
+                <h2>📤 Upload your image</h2>
+                <label class="upload-area" for="imageInput">
+                    <input type="file" id="imageInput" accept="image/*">
+                    <strong>Click to browse</strong>
+                    <span>We support PNG, JPG, GIF, BMP, TIFF, and WEBP formats.</span>
+                </label>
+                <div class="preview" id="preview"></div>
+                <div class="actions">
+                    <button id="processBtn" disabled>Run OCR</button>
+                    <div class="status">
+                        <div id="statusText">Select an image to begin.</div>
+                        <div class="progress-bar" aria-hidden="true">
+                            <span id="progress"></span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            <section class="results-card">
+                <h3>📄 Extracted text</h3>
+                <textarea id="output" placeholder="The detected text will appear here..." readonly></textarea>
+                <div class="hints">
+                    <strong>Tips for best results:</strong>
+                    <ul>
+                        <li>Use high-resolution images with good lighting and contrast.</li>
+                        <li>Crop unnecessary borders before uploading for faster detection.</li>
+                        <li>Tesseract works offline here—no data ever leaves your browser.</li>
+                    </ul>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@4/dist/tesseract.min.js"></script>
+    <script>
+        const imageInput = document.getElementById('imageInput');
+        const processBtn = document.getElementById('processBtn');
+        const statusText = document.getElementById('statusText');
+        const progressBar = document.getElementById('progress');
+        const output = document.getElementById('output');
+        const preview = document.getElementById('preview');
+
+        imageInput.addEventListener('change', () => {
+            const [file] = imageInput.files || [];
+            preview.innerHTML = '';
+            output.value = '';
+            progressBar.style.width = '0%';
+            statusText.textContent = file ? 'Ready to extract text.' : 'Select an image to begin.';
+            processBtn.disabled = !file;
+
+            if (file) {
+                const img = document.createElement('img');
+                img.alt = 'Selected image preview';
+                const reader = new FileReader();
+                reader.addEventListener('load', () => {
+                    img.src = reader.result;
+                });
+                reader.readAsDataURL(file);
+                preview.appendChild(img);
+            }
+        });
+
+        processBtn.addEventListener('click', async () => {
+            const [file] = imageInput.files || [];
+            if (!file) {
+                return;
+            }
+
+            processBtn.disabled = true;
+            statusText.textContent = 'Initializing OCR...';
+            progressBar.style.width = '8%';
+            output.value = '';
+
+            try {
+                const { data } = await Tesseract.recognize(file, 'eng', {
+                    logger: (m) => {
+                        if (m.status === 'recognizing text') {
+                            const pct = Math.min(100, Math.round(m.progress * 100));
+                            progressBar.style.width = pct + '%';
+                            statusText.textContent = `Recognizing text… ${pct}%`;
+                        } else {
+                            statusText.textContent = m.status.replace(/_/g, ' ');
+                        }
+                    },
+                });
+
+                progressBar.style.width = '100%';
+                statusText.textContent = 'Completed!';
+                output.value = data.text.trim() || '[No text detected]';
+            } catch (error) {
+                console.error(error);
+                statusText.textContent = 'An error occurred while processing the image.';
+                output.value = error.message || String(error);
+            } finally {
+                processBtn.disabled = false;
+            }
+        });
+    </script>
+</body>
+</html>

@@ -46,6 +46,30 @@
             font-size: 1.1rem;
         }
 
+        .header-actions {
+            margin-top: 20px;
+            display: flex;
+            justify-content: center;
+        }
+
+        .header-link {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 10px 18px;
+            border-radius: 999px;
+            text-decoration: none;
+            font-weight: 500;
+            transition: background 0.3s ease, transform 0.3s ease;
+        }
+
+        .header-link:hover {
+            background: rgba(255, 255, 255, 0.35);
+            transform: translateY(-2px);
+        }
+
         .content {
             padding: 30px;
         }
@@ -712,6 +736,9 @@
         <div class="header">
             <h1>Simple CRM</h1>
             <p>Manage your contacts with style</p>
+            <div class="header-actions">
+                <a class="header-link" href="ocr.html">📝 Try the OCR Text Extractor</a>
+            </div>
         </div>
 
         <div class="content">
